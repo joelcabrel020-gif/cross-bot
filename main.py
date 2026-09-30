@@ -1432,6 +1432,9 @@ import botcommands, config, cross, db, health
 import add_channel, admin, admin_tools, commands, my_channels, router, start
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+# Les journaux HTTP affichent l'adresse complète des requêtes Telegram, qui contient le token : on les masque.
+for _noisy in ("httpx", "httpcore", "telegram", "apscheduler"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("crossbot")
 
 
