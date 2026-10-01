@@ -50,7 +50,8 @@ DEFAULT_HEADER = (
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 '''
-_SOURCES['db'] = r'''import time
+_SOURCES['db'] = r'''import os
+import time
 
 from sqlalchemy import create_engine, inspect, text
 
@@ -205,6 +206,56 @@ def list_channels_page(offset, limit):
 
 def count_total():
     return _q("SELECT COUNT(*) AS n FROM channels")[0]["n"]
+
+
+# ---- type de base (alerte si les données risquent d'être perdues)
+def is_postgres():
+    return config.DATABASE_URL.startswith("postgresql")
+
+
+def is_temporary():
+    """SQLite sur Render : le fichier est effacé à chaque redémarrage."""
+    return (not is_postgres()) and bool(os.getenv("RENDER"))
+
+
+def kind_label():
+    if is_postgres():
+        return "✅ Neon / PostgreSQL (permanente)"
+    return "⚠️ SQLite TEMPORAIRE (canaux effacés au redémarrage)" if is_temporary() else "💾 SQLite locale"
+
+
+# ---- sauvegarde / restauration
+_BACKUP_KEYS = ("header", "photo", "times", "duration", "pause", "mode", "sched_on")
+
+
+def export_backup():
+    settings = {k: get_setting(k) for k in _BACKUP_KEYS if get_setting(k) is not None}
+    channels = _q("SELECT id, owner_id, title, link, members, status, publish FROM channels ORDER BY added_at, id")
+    extras = [{"label": e["label"], "link": e["link"]} for e in list_extras()]
+    return {"version": 1, "channels": channels, "extras": extras, "settings": settings}
+
+
+def restore_backup(data):
+    """Remet en place canaux, sponsors et réglages. Retourne (nb_canaux, nb_sponsors)."""
+    n_ch = n_ex = 0
+    for it in data.get("channels", []):
+        try:
+            status = it.get("status") if it.get("status") in ("active", "pending", "lost") else "active"
+            upsert_channel(int(it["id"]), int(it["owner_id"]), str(it["title"]), str(it["link"]),
+                           int(it.get("members") or 0), status, 0 if it.get("publish") == 0 else 1)
+            n_ch += 1
+        except (KeyError, ValueError, TypeError):
+            continue
+    if not list_extras():
+        for e in data.get("extras", []):
+            if e.get("label") and e.get("link"):
+                add_extra(str(e["label"])[:40], str(e["link"]))
+                n_ex += 1
+                time.sleep(0.002)  # identifiants uniques
+    for k, v in (data.get("settings") or {}).items():
+        if k in _BACKUP_KEYS and v is not None:
+            set_setting(k, str(v))
+    return n_ch, n_ex
 '''
 _SOURCES['keyboards'] = r'''from telegram import InlineKeyboardButton as _B
 from telegram import InlineKeyboardMarkup as M
@@ -287,6 +338,7 @@ def admin(pending):
         [B("⏰  Planning", "adm_plan", "primary"), B("⭐  Sponsors", "adm_sp")],
         [B("🔄  Synchroniser", "adm_sync"), B(f"⏳  En attente ({pending})", "adm_pending")],
         [B("📋  Tous les canaux", "adm_all")],
+        [B("💾  Sauvegarde", "adm_backup"), B("♻️  Restaurer", "adm_restore")],
         [B("⬅️  Menu", "menu")],
     ])
 
@@ -405,7 +457,8 @@ ADMIN = (
     "👤 Utilisateurs : <b>{users}</b>\n"
     "🟢 Canaux actifs : <b>{active}</b>\n"
     "⏳ En attente : <b>{pending}</b>\n"
-    "👥 Audience totale : <b>{members}</b>"
+    "👥 Audience totale : <b>{members}</b>\n"
+    "💾 Base : {db}"
 )
 ADMIN_HEADER = (
     "✏️ <b>Texte de la cross</b>\n" + LINE + "\n\n"
@@ -457,6 +510,21 @@ ADDED_NOPUB = (
     "Il apparaît en bouton dans tous les autres canaux."
 )
 PAUSE_ASK = "⏸ <b>Pause entre deux diffusions</b>\n" + LINE + "\n\nEnvoie combien de temps le bot attend avant de republier la cross.\nExemples : <code>2h</code>, <code>2h30</code>, <code>45min</code>"
+
+WARN_TEMP_DB = (
+    "⚠️ <b>Base de données TEMPORAIRE</b>\n" + LINE + "\n\n"
+    "Le bot n'est pas relié à Neon : tes canaux seront <b>effacés</b> au prochain redémarrage.\n\n"
+    "Sur Render, ajoute la variable <code>DATABASE_URL</code> avec ton lien Neon (<code>postgresql://…</code>)."
+)
+BACKUP_CAPTION = "💾 <b>Sauvegarde de la cross</b>\n{n} canaux.\nGarde ce fichier. Pour restaurer : /restaurer puis envoie-le ici."
+RESTORE_ASK = (
+    "♻️ <b>Restaurer une sauvegarde</b>\n" + LINE + "\n\n"
+    "Envoie-moi le fichier <b>sauvegarde_cross….json</b> que le bot t'a envoyé.\n"
+    "Les canaux, sponsors et réglages seront remis en place."
+)
+RESTORED = "✅ <b>Sauvegarde restaurée</b>\n" + LINE + "\n\n📣 {n} canaux\n⭐ {s} sponsors\n\nLa cross se met à jour."
+ERR_BACKUP = "⚠️ Fichier illisible. Envoie le fichier <b>.json</b> de sauvegarde."
+NO_BACKUP = "⚠️ Aucun canal à sauvegarder pour le moment."
 '''
 _SOURCES['ui'] = r'''"""Panneau unique : chaque étape édite le même message, les messages de l'utilisateur sont supprimés."""
 from telegram import LinkPreviewOptions
@@ -533,6 +601,7 @@ def page_of(update, prefix):
 '''
 _SOURCES['cross'] = r'''"""Coeur du bot : publication, mise à jour et suppression planifiée de la cross."""
 import asyncio
+import json
 import logging
 import math
 import random
@@ -915,6 +984,34 @@ async def drop_message(bot, ch):
     """Supprime le message de cross d'un canal (sans le retirer de la liste)."""
     await remove_message(bot, ch)
     db.set_msg(ch["id"], None)
+
+
+# ------------------------------------------------------------------ sauvegarde
+def backup_file():
+    data = db.export_backup()
+    raw = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+    return raw, len(data["channels"])
+
+
+async def send_backup(bot, chat_id, silent=False):
+    raw, n = backup_file()
+    if not n:
+        return False
+    name = f"sauvegarde_cross_{datetime.now(TZ):%Y-%m-%d_%H%M}.json"
+    await bot.send_document(
+        chat_id, document=raw, filename=name, caption=texts.BACKUP_CAPTION.format(n=n),
+        parse_mode=ParseMode.HTML, disable_notification=silent,
+    )
+    return True
+
+
+async def backup_job(context):
+    """Chaque nuit : envoie une sauvegarde à chaque admin (en silence)."""
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await send_backup(context.bot, admin_id, silent=True)
+        except TelegramError as e:
+            log.warning("Sauvegarde non envoyée à %s : %s", admin_id, e)
 '''
 _SOURCES['add_channel'] = r'''import html
 import re
@@ -1064,7 +1161,8 @@ async def _panel(update, context):
     context.user_data.pop("state", None)
     pending = db.count("pending")
     text = texts.ADMIN.format(
-        users=db.count_users(), active=db.count("active"), pending=pending, members=db.total_members()
+        users=db.count_users(), active=db.count("active"), pending=pending, members=db.total_members(),
+        db=db.kind_label(),
     )
     await ui.show(update, context, text, kb.admin(pending))
 
@@ -1193,6 +1291,7 @@ async def on_photo_del(update, context):
 '''
 _SOURCES['admin_tools'] = r'''"""Outils admin : planning (publication / suppression automatiques) et sponsors."""
 import html
+import json
 
 import config, cross, db, keyboards as kb, texts, ui
 from admin import _panel, admin_only
@@ -1378,6 +1477,36 @@ async def on_pause_ask(update, context):
     await ui.ack(update)
     context.user_data["state"] = "await_pause"
     await ui.show(update, context, texts.PAUSE_ASK, kb.back("adm_plan"))
+
+
+# ------------------------------------------------------------------ sauvegarde / restauration
+@admin_only
+async def on_backup(update, context):
+    sent = await cross.send_backup(context.bot, update.effective_user.id)
+    await ui.ack(update, "Sauvegarde envoyée 💾" if sent else "Aucun canal à sauvegarder", show_alert=not sent)
+
+
+@admin_only
+async def on_restore_ask(update, context):
+    await ui.ack(update)
+    context.user_data["state"] = "await_backup"
+    await ui.show(update, context, texts.RESTORE_ASK, kb.back("admin"))
+
+
+async def handle_backup(update, context):
+    doc = update.message.document
+    await ui.clean(update)
+    if not doc or (doc.file_size or 0) > 5_000_000:
+        return await ui.show(update, context, texts.ERR_BACKUP, kb.back("admin"))
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        data = json.loads(bytes(await tg_file.download_as_bytearray()).decode("utf-8"))
+        n_ch, n_ex = db.restore_backup(data)
+    except Exception:
+        return await ui.show(update, context, texts.ERR_BACKUP, kb.back("admin"))
+    context.user_data.pop("state", None)
+    context.application.create_task(cross.sync_all(context.bot))
+    await ui.show(update, context, texts.RESTORED.format(n=n_ch, s=n_ex), kb.back("admin"))
 '''
 _SOURCES['botcommands'] = r'''"""Menu des commandes (bouton « Menu » à côté de la zone de saisie). Les commandes admin ne sont visibles que par les admins."""
 import logging
@@ -1401,6 +1530,8 @@ ADMIN = USER + [
     BotCommand("sponsors", "⭐ Gérer les sponsors"),
     BotCommand("publier", "🚀 Publier maintenant"),
     BotCommand("retirer", "🛑 Retirer maintenant"),
+    BotCommand("sauvegarde", "💾 Sauvegarder les canaux"),
+    BotCommand("restaurer", "♻️ Restaurer une sauvegarde"),
 ]
 
 
@@ -1571,6 +1702,19 @@ async def cmd_stop(update, context):
     if cross.schedule_on():
         context.application.create_task(cross.end_cycle(context.bot))
     await admin_tools._planning(update, context)
+
+
+@_admin_cmd
+async def cmd_backup(update, context):
+    sent = await cross.send_backup(context.bot, update.effective_user.id)
+    if not sent:
+        await ui.show(update, context, texts.NO_BACKUP, kb.back("admin"))
+
+
+@_admin_cmd
+async def cmd_restore(update, context):
+    context.user_data["state"] = "await_backup"
+    await ui.show(update, context, texts.RESTORE_ASK, kb.back("admin"))
 '''
 _SOURCES['health'] = r'''"""Mini serveur HTTP : Render exige un port ouvert, et UptimeRobot peut le pinger."""
 import threading
@@ -1609,6 +1753,8 @@ async def on_message(update, context):
         await admin.handle_header(update, context)
     elif state == "await_photo" and config.is_admin(update.effective_user.id):
         await admin.handle_photo(update, context)
+    elif state == "await_backup" and config.is_admin(update.effective_user.id):
+        await admin_tools.handle_backup(update, context)
     elif state in admin_tools.STATES and config.is_admin(update.effective_user.id):
         await admin_tools.handle_input(update, context)
     else:
@@ -1644,11 +1790,12 @@ async def on_menu(update, context):
         await ui.show(update, context, text, markup)
 '''
 _SOURCES['botmain'] = r'''import logging
+from datetime import time as dtime
 
 from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
-import botcommands, config, cross, db, health
+import botcommands, config, cross, db, health, texts
 import add_channel, admin, admin_tools, commands, my_channels, router, start
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
@@ -1661,6 +1808,14 @@ log = logging.getLogger("crossbot")
 async def post_init(app: Application):
     db.init()
     await botcommands.setup(app.bot)
+    log.info("Base de données : %s", db.kind_label())
+    if db.is_temporary():
+        log.warning("BASE TEMPORAIRE : ajoute DATABASE_URL (Neon) sur Render, sinon les canaux seront perdus.")
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await app.bot.send_message(admin_id, texts.WARN_TEMP_DB, parse_mode="HTML")
+            except Exception:
+                pass
     log.info("Bot démarré : @%s", app.bot.username)
 
 
@@ -1682,6 +1837,7 @@ def main():
         ("ajouter", commands.cmd_add), ("canaux", commands.cmd_mine), ("aide", commands.cmd_help),
         ("admin", commands.cmd_admin), ("planning", commands.cmd_planning), ("sponsors", commands.cmd_sponsors),
         ("publier", commands.cmd_publish), ("retirer", commands.cmd_stop),
+        ("sauvegarde", commands.cmd_backup), ("restaurer", commands.cmd_restore),
     ]:
         app.add_handler(CommandHandler(name, fn, filters=private))
 
@@ -1700,6 +1856,8 @@ def main():
     app.add_handler(cb(admin.on_photo_ask, pattern=r"^adm_photo$"))
     app.add_handler(cb(admin.on_photo_del, pattern=r"^adm_photo_del$"))
     app.add_handler(cb(admin.on_sync, pattern=r"^adm_sync$"))
+    app.add_handler(cb(admin_tools.on_backup, pattern=r"^adm_backup$"))
+    app.add_handler(cb(admin_tools.on_restore_ask, pattern=r"^adm_restore$"))
     app.add_handler(cb(admin_tools.on_planning, pattern=r"^adm_plan$"))
     app.add_handler(cb(admin_tools.on_toggle, pattern=r"^adm_plan_toggle$"))
     app.add_handler(cb(admin_tools.on_mode, pattern=r"^adm_plan_mode$"))
@@ -1720,6 +1878,7 @@ def main():
     app.add_error_handler(on_error)
 
     app.job_queue.run_repeating(cross.tick, interval=60, first=15)
+    app.job_queue.run_daily(cross.backup_job, time=dtime(3, 0, tzinfo=cross.TZ))  # sauvegarde chaque nuit à 03:00
 
     app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
 
