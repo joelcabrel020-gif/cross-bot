@@ -7,6 +7,7 @@ import types
 
 _SOURCES = {}
 _SOURCES['config'] = r'''import os
+import re
 
 from dotenv import load_dotenv
 
@@ -15,7 +16,23 @@ load_dotenv()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 
-DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///crossbot.db"
+_PG = re.compile(r"postgres(?:ql)?://[^\s'\"]+")
+
+
+def _find_database_url():
+    """Cherche le lien Neon : d'abord DATABASE_URL, puis n'importe quelle variable contenant un lien postgresql://
+    (nom mal écrit, guillemets, texte autour du lien...)."""
+    candidates = [os.getenv("DATABASE_URL", "")] + [v for k, v in os.environ.items() if k != "DATABASE_URL"]
+    for value in candidates:
+        m = _PG.search(value or "")
+        if m:
+            return m.group(0)
+    return None
+
+
+DATABASE_URL = _find_database_url() or "sqlite:///crossbot.db"
+# noms de variables qui ressemblent à une base de données (pour t'aider à repérer une faute de frappe)
+DB_HINT_NAMES = sorted(k for k in os.environ if re.search(r"DATA|BASE|NEON|POSTG|^PG|DB", k, re.I))
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
@@ -514,7 +531,8 @@ PAUSE_ASK = "⏸ <b>Pause entre deux diffusions</b>\n" + LINE + "\n\nEnvoie comb
 WARN_TEMP_DB = (
     "⚠️ <b>Base de données TEMPORAIRE</b>\n" + LINE + "\n\n"
     "Le bot n'est pas relié à Neon : tes canaux seront <b>effacés</b> au prochain redémarrage.\n\n"
-    "Sur Render, ajoute la variable <code>DATABASE_URL</code> avec ton lien Neon (<code>postgresql://…</code>)."
+    "Sur Render, ajoute la variable <code>DATABASE_URL</code> avec ton lien Neon (<code>postgresql://…</code>).\n\n"
+    "🔎 Variables vues par le bot qui ressemblent à une base : <b>{names}</b>"
 )
 BACKUP_CAPTION = "💾 <b>Sauvegarde de la cross</b>\n{n} canaux.\nGarde ce fichier. Pour restaurer : /restaurer puis envoie-le ici."
 RESTORE_ASK = (
@@ -1813,7 +1831,7 @@ async def post_init(app: Application):
         log.warning("BASE TEMPORAIRE : ajoute DATABASE_URL (Neon) sur Render, sinon les canaux seront perdus.")
         for admin_id in config.ADMIN_IDS:
             try:
-                await app.bot.send_message(admin_id, texts.WARN_TEMP_DB, parse_mode="HTML")
+                await app.bot.send_message(admin_id, texts.WARN_TEMP_DB.format(names=", ".join(config.DB_HINT_NAMES) or "aucune"), parse_mode="HTML")
             except Exception:
                 pass
     log.info("Bot démarré : @%s", app.bot.username)
