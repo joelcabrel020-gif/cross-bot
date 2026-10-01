@@ -349,12 +349,12 @@ def delete_confirm(cid):
     return M([[B("🗑  Oui, retirer", f"delok:{cid}", "danger"), B("↩️  Non", f"ch:{cid}")]])
 
 
-def admin(pending):
+def admin(pending, approval=False):
     return M([
         [B("✏️  Texte", "adm_text"), B("🖼  Photo", "adm_photo")],
         [B("⏰  Planning", "adm_plan", "primary"), B("⭐  Sponsors", "adm_sp")],
         [B("🔄  Synchroniser", "adm_sync"), B(f"⏳  En attente ({pending})", "adm_pending")],
-        [B("📋  Tous les canaux", "adm_all")],
+        [B("📋  Tous les canaux", "adm_all"), B("🔐  Validation : ON" if approval else "🔓  Validation : OFF", "adm_approval")],
         [B("💾  Sauvegarde", "adm_backup"), B("♻️  Restaurer", "adm_restore")],
         [B("⬅️  Menu", "menu")],
     ])
@@ -475,6 +475,7 @@ ADMIN = (
     "🟢 Canaux actifs : <b>{active}</b>\n"
     "⏳ En attente : <b>{pending}</b>\n"
     "👥 Audience totale : <b>{members}</b>\n"
+    "🔐 Validation des canaux : <b>{approval}</b>\n"
     "💾 Base : {db}"
 )
 ADMIN_HEADER = (
@@ -671,6 +672,13 @@ def build_markup(bot_username, channels, extras=()):
         rows.append([B(e["label"][:40], url=e["link"], style="success")])
     rows.append([B("➕  Rejoindre la cross", url=f"https://t.me/{bot_username}", style="primary")])
     return M(rows)
+
+
+# ------------------------------------------------------------------ validation des canaux
+def approval_required():
+    """Validation manuelle des nouveaux canaux : réglage du bot, sinon variable REQUIRE_APPROVAL."""
+    v = db.get_setting("approval")
+    return config.REQUIRE_APPROVAL if v is None else v == "1"
 
 
 # ------------------------------------------------------------------ planning
@@ -1129,7 +1137,7 @@ async def on_confirm(update, context):
     if not d:
         return await ui.show(update, context, texts.MENU.format(n=db.count("active")), kb.menu(config.is_admin(uid)))
 
-    pending = config.REQUIRE_APPROVAL and not config.is_admin(uid)
+    pending = cross.approval_required() and not config.is_admin(uid)
     publish = 0 if (q.data == "confirm_nopub" and config.is_admin(uid)) else 1
     db.upsert_channel(d["id"], uid, d["title"], d["link"], d["members"], "pending" if pending else "active", publish)
 
@@ -1180,9 +1188,9 @@ async def _panel(update, context):
     pending = db.count("pending")
     text = texts.ADMIN.format(
         users=db.count_users(), active=db.count("active"), pending=pending, members=db.total_members(),
-        db=db.kind_label(),
+        db=db.kind_label(), approval="activée" if cross.approval_required() else "désactivée",
     )
-    await ui.show(update, context, text, kb.admin(pending))
+    await ui.show(update, context, text, kb.admin(pending, cross.approval_required()))
 
 
 async def _notify(bot, uid, text):
@@ -1216,6 +1224,14 @@ async def handle_header(update, context):
         return await ui.show(update, context, texts.ERR_CAPTION, kb.back("admin"))
     db.set_setting("header", new)
     context.application.create_task(cross.sync_all(context.bot))
+    await _panel(update, context)
+
+
+@admin_only
+async def on_approval(update, context):
+    new = not cross.approval_required()
+    db.set_setting("approval", "1" if new else "0")
+    await ui.ack(update, "Validation activée 🔐" if new else "Validation désactivée 🔓")
     await _panel(update, context)
 
 
@@ -1874,6 +1890,7 @@ def main():
     app.add_handler(cb(admin.on_photo_ask, pattern=r"^adm_photo$"))
     app.add_handler(cb(admin.on_photo_del, pattern=r"^adm_photo_del$"))
     app.add_handler(cb(admin.on_sync, pattern=r"^adm_sync$"))
+    app.add_handler(cb(admin.on_approval, pattern=r"^adm_approval$"))
     app.add_handler(cb(admin_tools.on_backup, pattern=r"^adm_backup$"))
     app.add_handler(cb(admin_tools.on_restore_ask, pattern=r"^adm_restore$"))
     app.add_handler(cb(admin_tools.on_planning, pattern=r"^adm_plan$"))
