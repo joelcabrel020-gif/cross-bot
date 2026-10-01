@@ -22,13 +22,16 @@ elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
 MIN_MEMBERS = int(os.getenv("MIN_MEMBERS", "1000"))  # 1K minimum (les admins sont exemptés)
-MAX_CHANNELS = min(int(os.getenv("MAX_CHANNELS", "60")), 85)  # limite Telegram : 100 boutons
-MAX_PER_USER = int(os.getenv("MAX_PER_USER", "3"))
+MAX_CHANNELS = int(os.getenv("MAX_CHANNELS", "10000"))
+GROUP_SIZE = min(max(int(os.getenv("GROUP_SIZE", "80")), 10), 88)  # canaux par message (Telegram : 100 boutons max)
+MAX_PER_USER = int(os.getenv("MAX_PER_USER", "1000"))
 REQUIRE_APPROVAL = os.getenv("REQUIRE_APPROVAL", "false").lower() == "true"
 BUTTONS_PER_ROW = max(1, min(int(os.getenv("BUTTONS_PER_ROW", "2")), 4))
 TIMEZONE = os.getenv("TIMEZONE", "Africa/Douala")
 DEFAULT_TIMES = os.getenv("POST_TIMES", "10:00,18:00")          # modifiable ensuite dans le bot
-DEFAULT_DURATION = float(os.getenv("DELETE_AFTER_HOURS", "6"))  # modifiable ensuite dans le bot
+DEFAULT_DURATION = float(os.getenv("DELETE_AFTER_HOURS", "1.5"))  # modifiable ensuite dans le bot
+DEFAULT_PAUSE = float(os.getenv("PAUSE_HOURS", "2"))              # pause entre deux diffusions (mode répétition)
+DEFAULT_MODE = os.getenv("SCHEDULE_MODE", "cycle")                # "cycle" (répétition) ou "daily" (horaires fixes)
 SPONSOR_EVERY = max(1, int(os.getenv("SPONSOR_EVERY", "10")))    # 1 sponsor tous les X canaux
 BUTTON_NAME_MAX = max(8, int(os.getenv("BUTTON_NAME_MAX", "16")))  # nom coupé au-delà, pour que la pastille de fin reste visible
 BUTTON_ICONS = [i.strip() for i in os.getenv("BUTTON_ICONS", "⭐,✨,🌟,💫").split(",") if i.strip()]
@@ -65,6 +68,7 @@ SCHEMA = [
         status TEXT NOT NULL DEFAULT 'active',
         cross_msg_id BIGINT,
         publish INTEGER NOT NULL DEFAULT 1,
+        grp INTEGER,
         added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""",
     "CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)",
@@ -90,6 +94,8 @@ def init():
     cols = {c["name"] for c in inspect(engine).get_columns("channels")}
     if "publish" not in cols:
         _x("ALTER TABLE channels ADD COLUMN publish INTEGER NOT NULL DEFAULT 1")
+    if "grp" not in cols:
+        _x("ALTER TABLE channels ADD COLUMN grp INTEGER")
 
 
 # ---- utilisateurs / réglages
@@ -143,7 +149,7 @@ def upsert_channel(cid, owner_id, title, link, members, status, publish=1):
         """INSERT INTO channels (id, owner_id, title, link, members, status, publish)
            VALUES (:i, :o, :t, :l, :m, :s, :p)
            ON CONFLICT (id) DO UPDATE SET owner_id=:o, title=:t, link=:l,
-           members=:m, status=:s, publish=:p, cross_msg_id=NULL""",
+           members=:m, status=:s, publish=:p, cross_msg_id=NULL, grp=NULL""",
         i=cid, o=owner_id, t=title, l=link, m=members, s=status, p=publish,
     )
 
@@ -175,6 +181,30 @@ def add_extra(label, link):
 
 def delete_extra(eid):
     _x("DELETE FROM extras WHERE id=:i", i=eid)
+
+
+# ---- groupes (rotation) et pagination
+def set_group(cid, grp):
+    _x("UPDATE channels SET grp=:g WHERE id=:i", g=grp, i=cid)
+
+
+def set_groups(pairs):
+    if not pairs:
+        return
+    with engine.begin() as c:
+        c.execute(text("UPDATE channels SET grp=:g WHERE id=:i"), [{"g": g, "i": i} for i, g in pairs])
+
+
+def clear_all_msgs():
+    _x("UPDATE channels SET cross_msg_id=NULL")
+
+
+def list_channels_page(offset, limit):
+    return _q("SELECT * FROM channels ORDER BY added_at, id LIMIT :l OFFSET :o", l=limit, o=offset)
+
+
+def count_total():
+    return _q("SELECT COUNT(*) AS n FROM channels")[0]["n"]
 '''
 _SOURCES['keyboards'] = r'''from telegram import InlineKeyboardButton as _B
 from telegram import InlineKeyboardMarkup as M
@@ -222,8 +252,18 @@ def confirm(is_admin=False):
     return M([[B("✅  Confirmer", "confirm_add", "success"), B("✖️  Annuler", "menu", "danger")]])
 
 
-def my_channels(channels):
+def _nav(prefix, page, pages):
+    nav = []
+    if page > 0:
+        nav.append(B("◀️  Précédent", f"{prefix}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(B("Suivant  ▶️", f"{prefix}:{page + 1}"))
+    return [nav] if nav else []
+
+
+def my_channels(channels, page=0, pages=1):
     rows = [[B(f"{icon(c['status'])}  {c['title'][:35]}", f"ch:{c['id']}")] for c in channels]
+    rows += _nav("mine", page, pages)
     rows.append([B("⬅️  Retour", "menu")])
     return M(rows)
 
@@ -257,8 +297,9 @@ def pending_list(channels):
     return M(rows)
 
 
-def all_list(channels):
+def all_list(channels, page=0, pages=1):
     rows = [[B(f"🗑  {c['title'][:35]}", f"admdel:{c['id']}")] for c in channels]
+    rows += _nav("adm_all", page, pages)
     rows.append([B("⬅️  Retour", "admin")])
     return M(rows)
 
@@ -271,10 +312,13 @@ def photo_menu():
     return M([[B("🗑  Retirer la photo", "adm_photo_del", "danger")], [B("⬅️  Retour", "admin")]])
 
 
-def planning(on):
+def planning(on, mode="cycle"):
+    cycle = mode == "cycle"
     return M([
         [B("🔴  Désactiver le planning", "adm_plan_toggle", "danger") if on else B("🟢  Activer le planning", "adm_plan_toggle", "success")],
-        [B("🕒  Horaires", "adm_plan_times"), B("⏳  Durée", "adm_plan_duration")],
+        [B("🔁  Mode : répétition" if cycle else "📅  Mode : horaires fixes", "adm_plan_mode")],
+        [B("⏳  Durée", "adm_plan_duration"), B("⏸  Pause", "adm_plan_pause")] if cycle
+        else [B("🕒  Horaires", "adm_plan_times"), B("⏳  Durée", "adm_plan_duration")],
         [B("🚀  Publier maintenant", "adm_plan_now", "success"), B("🛑  Retirer maintenant", "adm_plan_stop", "danger")],
         [B("⬅️  Retour", "admin")],
     ])
@@ -379,15 +423,16 @@ ERR_CAPTION = "⚠️ Avec une photo, le texte est limité à <b>1024 caractère
 PLANNING = (
     "⏰ <b>Planning</b>\n" + LINE + "\n\n"
     "Statut : {status}\n"
-    "🕒 Horaires ({tz}) : <b>{times}</b>\n"
+    "🔁 Mode : <b>{mode}</b>\n"
+    "{schedule}\n"
     "⏳ Durée d'affichage : <b>{duration}</b>\n"
     "📡 En ce moment : {live}\n\n"
-    "<i>Chaque jour, la cross est publiée toute seule à ces horaires, puis supprimée après la durée choisie.</i>"
+    "<i>{explain}</i>"
 )
 TIMES_ASK = "🕒 <b>Horaires de publication</b>\n" + LINE + "\n\nEnvoie les heures (fuseau {tz}) séparées par des espaces.\nExemple : <code>10:00 18:00 22:30</code>"
-DURATION_ASK = "⏳ <b>Durée d'affichage</b>\n" + LINE + "\n\nEnvoie le nombre d'heures avant la suppression automatique.\nExemples : <code>6</code> ou <code>1.5</code>"
+DURATION_ASK = "⏳ <b>Durée d'affichage</b>\n" + LINE + "\n\nEnvoie combien de temps la cross reste affichée avant d'être supprimée.\nExemples : <code>1h30</code>, <code>90min</code>, <code>2</code>"
 ERR_TIMES = "⚠️ Aucune heure valide. Exemple : <code>10:00 18:00</code>"
-ERR_DURATION = "⚠️ Envoie un nombre d'heures entre 0.25 et 72. Exemple : <code>6</code>"
+ERR_DURATION = "⚠️ Envoie une durée entre 15 minutes et 72 heures. Exemples : <code>1h30</code>, <code>90min</code>, <code>2</code>"
 
 SPONSORS = (
     "⭐ <b>Sponsors</b>\n" + LINE + "\n\n"
@@ -411,6 +456,7 @@ ADDED_NOPUB = (
     "🚫 La cross ne sera <b>pas publiée</b> dans ce canal.\n"
     "Il apparaît en bouton dans tous les autres canaux."
 )
+PAUSE_ASK = "⏸ <b>Pause entre deux diffusions</b>\n" + LINE + "\n\nEnvoie combien de temps le bot attend avant de republier la cross.\nExemples : <code>2h</code>, <code>2h30</code>, <code>45min</code>"
 '''
 _SOURCES['ui'] = r'''"""Panneau unique : chaque étape édite le même message, les messages de l'utilisateur sont supprimés."""
 from telegram import LinkPreviewOptions
@@ -469,10 +515,27 @@ async def ack(update, text=None, show_alert=False):
             await q.answer(text, show_alert=show_alert)
         except TelegramError:
             pass
+
+
+PAGE_SIZE = 8
+
+
+def page_of(update, prefix):
+    """Numéro de page demandé par un bouton « prefix:N » (0 sinon)."""
+    q = update.callback_query
+    data = q.data if q else ""
+    if data.startswith(prefix + ":"):
+        try:
+            return max(0, int(data.split(":")[1]))
+        except ValueError:
+            return 0
+    return 0
 '''
 _SOURCES['cross'] = r'''"""Coeur du bot : publication, mise à jour et suppression planifiée de la cross."""
 import asyncio
 import logging
+import math
+import random
 import re
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
@@ -488,6 +551,7 @@ from ui import NO_PREVIEW
 log = logging.getLogger(__name__)
 TZ = ZoneInfo(config.TIMEZONE)
 _lock = asyncio.Lock()
+SEND_DELAY = 0.12  # pause entre deux envois (Telegram tolère environ 30 envois par seconde)
 _LOST_HINTS = ("chat not found", "not enough rights", "kicked", "administrator", "no rights", "deactivated")
 
 
@@ -545,6 +609,42 @@ def get_times():
     return parse_times(db.get_setting("times", config.DEFAULT_TIMES))
 
 
+def get_mode():
+    return "daily" if db.get_setting("mode", config.DEFAULT_MODE) == "daily" else "cycle"
+
+
+def get_pause():
+    try:
+        return float(db.get_setting("pause", str(config.DEFAULT_PAUSE)))
+    except ValueError:
+        return config.DEFAULT_PAUSE
+
+
+def parse_hours(raw):
+    """« 1h30 », « 90min », « 1.5 », « 2h » -> nombre d'heures (0 si illisible)."""
+    t = (raw or "").lower().replace(",", ".").replace(" ", "")
+    m = re.fullmatch(r"(\d+)h(\d{1,2})(?:min|m)?", t)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / 60
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(?:min|m)", t)
+    if m:
+        return float(m.group(1)) / 60
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)h?", t)
+    if m:
+        return float(m.group(1))
+    return 0
+
+
+def fmt_hours(h):
+    total = int(round(h * 60))
+    hh, mm = divmod(total, 60)
+    if hh and mm:
+        return f"{hh} h {mm:02d} min"
+    if hh:
+        return f"{hh} h"
+    return f"{mm} min"
+
+
 def get_duration():
     try:
         return float(db.get_setting("duration", str(config.DEFAULT_DURATION)))
@@ -557,7 +657,23 @@ def _slot(day, hhmm):
     return datetime.combine(day, dtime(h, m), tzinfo=TZ)
 
 
+def next_start_str():
+    raw = db.get_setting("next_start", "")
+    now = datetime.now(TZ)
+    try:
+        dt = datetime.fromisoformat(raw).astimezone(TZ)
+    except ValueError:
+        return "dans un instant"
+    if dt <= now:
+        return "dans un instant"
+    days = (dt.date() - now.date()).days
+    day = "aujourd'hui" if days == 0 else "demain" if days == 1 else dt.strftime("%d/%m")
+    return f"{day} à {dt:%H:%M}"
+
+
 def next_slot_str():
+    if get_mode() == "cycle":
+        return next_start_str()
     now = datetime.now(TZ)
     times = get_times()
     if not times:
@@ -580,25 +696,29 @@ def until_str():
 
 def set_live_state():
     db.set_setting("live", "1")
+    db.set_setting("next_start", "")
+    assign_groups()  # rotation : les groupes changent à chaque diffusion
     db.set_setting("delete_at", (datetime.now(TZ) + timedelta(hours=get_duration())).isoformat())
 
 
 async def start_cycle(bot):
     set_live_state()
-    for ch in db.list_channels("active"):
-        db.set_msg(ch["id"], None)
+    db.clear_all_msgs()
     await sync_all(bot)
 
 
-async def end_cycle(bot):
+async def end_cycle(bot, restart_now=False):
     db.set_setting("live", "0")
     db.set_setting("delete_at", "")
+    if get_mode() == "cycle":  # répétition : la prochaine diffusion arrive après la pause
+        wait = timedelta(0) if restart_now else timedelta(hours=get_pause())
+        db.set_setting("next_start", (datetime.now(TZ) + wait).isoformat())
     async with _lock:
         for ch in db.list_channels():
             if ch.get("cross_msg_id"):
                 await remove_message(bot, ch)
-                db.set_msg(ch["id"], None)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(SEND_DELAY)
+        db.clear_all_msgs()
 
 
 async def tick(context):
@@ -612,6 +732,11 @@ async def tick(context):
             raw = db.get_setting("delete_at", "")
             if not raw or now >= datetime.fromisoformat(raw):
                 await end_cycle(bot)
+            return
+        if get_mode() == "cycle":
+            raw = db.get_setting("next_start", "")
+            if not raw or now >= datetime.fromisoformat(raw):
+                await start_cycle(bot)
             return
         slots = [_slot(now.date(), t) for t in get_times()]
         due = max((s for s in slots if s <= now), default=None)
@@ -681,22 +806,79 @@ async def _push(bot, ch, header, markup, photo=None):
     return False
 
 
-async def sync_all(bot):
+def assign_groups():
+    """Répartit les canaux actifs en groupes de GROUP_SIZE maximum.
+    Au-delà d'un groupe, la composition est mélangée à chaque diffusion : les canaux changent de partenaires."""
+    chans = db.list_channels("active")
+    n = len(chans)
+    if not n:
+        return
+    k = max(1, math.ceil(n / config.GROUP_SIZE))
+    if k > 1:
+        seed = int(db.get_setting("rotation", "0") or 0) + 1
+        db.set_setting("rotation", str(seed))
+        random.Random(seed).shuffle(chans)
+    db.set_groups([(c["id"], i * k // n) for i, c in enumerate(chans)])
+
+
+def _place_unassigned(channels):
+    """Place les canaux sans groupe (nouveaux inscrits) dans le groupe le moins rempli. Retourne les groupes touchés."""
+    sizes = {}
+    for c in channels:
+        if c.get("grp") is not None:
+            sizes[c["grp"]] = sizes.get(c["grp"], 0) + 1
+    touched = set()
+    for c in channels:
+        if c.get("grp") is None:
+            free = [g for g in sizes if sizes[g] < config.GROUP_SIZE]
+            g = min(free, key=lambda x: sizes[x]) if free else (max(sizes) + 1 if sizes else 0)
+            sizes[g] = sizes.get(g, 0) + 1
+            c["grp"] = g
+            db.set_group(c["id"], g)
+            touched.add(g)
+    return touched
+
+
+async def _sync(bot, only=None):
+    """Publie / met à jour la cross. only = groupes à traiter (None = tous)."""
     if not is_live():
         return
+    lost_groups = set()
     async with _lock:
         channels = db.list_channels("active")
-        header = db.get_setting("header", config.DEFAULT_HEADER).replace("{count}", str(len(channels)))
-        markup = build_markup(bot.username, channels, db.list_extras())
+        placed = _place_unassigned(channels)
+        if only is not None:
+            only = set(only) | placed
+        raw_header = db.get_setting("header", config.DEFAULT_HEADER)
+        extras = db.list_extras()
         photo = db.get_setting("photo") or None
-        any_lost = False
-        for ch in channels:
-            if ch.get("publish") == 0:  # canal en « liste seulement » : présent en bouton, pas de publication
+        groups = {}
+        for c in channels:
+            groups.setdefault(c["grp"], []).append(c)
+        for g in sorted(groups):
+            if only is not None and g not in only:
                 continue
-            any_lost |= await _push(bot, ch, header, markup, photo)
-            await asyncio.sleep(0.4)
-    if any_lost:
-        asyncio.create_task(sync_all(bot))
+            members = groups[g]
+            markup = build_markup(bot.username, members, extras)
+            header = raw_header.replace("{count}", str(len(members)))
+            for ch in members:
+                if ch.get("publish") == 0:  # « liste seulement » : présent en bouton, pas de publication
+                    continue
+                if await _push(bot, ch, header, markup, photo):
+                    lost_groups.add(g)
+                await asyncio.sleep(SEND_DELAY)
+    if lost_groups:
+        asyncio.create_task(_sync(bot, only=lost_groups))
+
+
+async def sync_all(bot):
+    """Met à jour tous les groupes (changement de texte, de photo, de sponsors...)."""
+    await _sync(bot)
+
+
+async def sync_touched(bot, groups=()):
+    """Ne met à jour que les groupes concernés (nouveau canal, canal retiré...)."""
+    await _sync(bot, only={g for g in groups if g is not None})
 
 
 async def remove_message(bot, ch):
@@ -715,16 +897,17 @@ async def remove_message(bot, ch):
 async def remove_channel(bot, ch):
     db.delete_channel(ch["id"])
     await remove_message(bot, ch)
-    await sync_all(bot)
+    await sync_touched(bot, {ch.get("grp")})
 
 
 async def repost_all(bot):
     if not is_live():
         return
     for ch in db.list_channels("active"):
-        await remove_message(bot, ch)
-        db.set_msg(ch["id"], None)
-        await asyncio.sleep(0.3)
+        if ch.get("cross_msg_id"):
+            await remove_message(bot, ch)
+            await asyncio.sleep(SEND_DELAY)
+    db.clear_all_msgs()
     await sync_all(bot)
 
 
@@ -836,7 +1019,7 @@ async def on_confirm(update, context):
     db.upsert_channel(d["id"], uid, d["title"], d["link"], d["members"], "pending" if pending else "active", publish)
 
     if not pending:
-        context.application.create_task(cross.sync_all(context.bot))
+        context.application.create_task(cross.sync_touched(context.bot))
         if not publish:
             msg = texts.ADDED_NOPUB
         else:
@@ -857,6 +1040,7 @@ async def on_confirm(update, context):
 '''
 _SOURCES['admin'] = r'''import functools
 import html
+import math
 import re
 
 from telegram.constants import ParseMode
@@ -928,7 +1112,7 @@ async def on_sync(update, context):
 @admin_only
 async def on_pending(update, context):
     await ui.ack(update)
-    channels = db.list_channels("pending")
+    channels = db.list_channels("pending")[:20]
     if not channels:
         return await _panel(update, context)
     lines = "\n".join(f"• {html.escape(c['title'])} ({c['members']} 👥)" for c in channels)
@@ -946,7 +1130,7 @@ async def on_decision(update, context):
         if action == "appr":
             db.set_status(ch["id"], "active")
             await _notify(context.bot, ch["owner_id"], texts.APPROVED.format(title=title))
-            context.application.create_task(cross.sync_all(context.bot))
+            context.application.create_task(cross.sync_touched(context.bot))
         else:
             db.delete_channel(ch["id"])
             await _notify(context.bot, ch["owner_id"], texts.REJECTED.format(title=title))
@@ -956,10 +1140,15 @@ async def on_decision(update, context):
 @admin_only
 async def on_all(update, context):
     await ui.ack(update)
-    channels = db.list_channels()
-    if not channels:
+    total = db.count_total()
+    if not total:
         return await _panel(update, context)
-    await ui.show(update, context, "📋 <b>TOUS LES CANAUX</b>\n━━━━━━━━━━━━━━━\n\nTouche un canal pour le supprimer.", kb.all_list(channels))
+    pages = max(1, math.ceil(total / ui.PAGE_SIZE))
+    page = min(ui.page_of(update, "adm_all"), pages - 1)
+    channels = db.list_channels_page(page * ui.PAGE_SIZE, ui.PAGE_SIZE)
+    text = "📋 <b>TOUS LES CANAUX</b>\n━━━━━━━━━━━━━━━\n\nTouche un canal pour le supprimer."
+    text += f"\n\n📄 Page {page + 1}/{pages}  ·  {total} canaux"
+    await ui.show(update, context, text, kb.all_list(channels, page, pages))
 
 
 @admin_only
@@ -1008,7 +1197,7 @@ import html
 import config, cross, db, keyboards as kb, texts, ui
 from admin import _panel, admin_only
 
-STATES = ("await_times", "await_duration", "await_sp_label", "await_sp_link")
+STATES = ("await_times", "await_duration", "await_pause", "await_sp_label", "await_sp_link")
 MAX_SPONSORS = 10
 
 
@@ -1022,14 +1211,24 @@ async def _planning(update, context):
         live = f"🟢 Publiée jusqu'à <b>{cross.until_str()}</b>"
     else:
         live = f"⚪ Non publiée — prochaine diffusion : <b>{cross.next_slot_str()}</b>"
+    mode = cross.get_mode()
+    if mode == "cycle":
+        mode_label = "🔁 Répétition automatique"
+        schedule = f"⏸ Pause entre deux diffusions : <b>{cross.fmt_hours(cross.get_pause())}</b>"
+        explain = "La cross est publiée, supprimée après la durée choisie, puis revient après la pause, en boucle, pour toujours."
+    else:
+        mode_label = "📅 Horaires fixes"
+        schedule = f"🕒 Horaires ({config.TIMEZONE}) : <b>{', '.join(cross.get_times()) or 'aucun'}</b>"
+        explain = "Chaque jour, la cross est publiée toute seule à ces horaires, puis supprimée après la durée choisie."
     text = texts.PLANNING.format(
         status="🟢 Activé" if on else "🔴 Désactivé",
-        tz=config.TIMEZONE,
-        times=", ".join(cross.get_times()) or "aucun",
-        duration=f"{cross.get_duration():g} h",
+        mode=mode_label,
+        schedule=schedule,
+        duration=cross.fmt_hours(cross.get_duration()),
         live=live,
+        explain=explain,
     )
-    await ui.show(update, context, text, kb.planning(on))
+    await ui.show(update, context, text, kb.planning(on, mode))
 
 
 @admin_only
@@ -1048,7 +1247,7 @@ async def on_toggle(update, context):
         context.application.create_task(cross.sync_all(context.bot))
     else:
         db.set_setting("sched_on", "1")
-        context.application.create_task(cross.end_cycle(context.bot))
+        context.application.create_task(cross.end_cycle(context.bot, restart_now=True))
     await _planning(update, context)
 
 
@@ -1143,14 +1342,12 @@ async def handle_input(update, context):
         db.set_setting("last_slot", "")
         return await _planning(update, context)
 
-    if state == "await_duration":
-        try:
-            hours = float(text.replace(",", ".").lower().replace("h", "").strip())
-        except ValueError:
-            hours = 0
+    if state in ("await_duration", "await_pause"):
+        hours = cross.parse_hours(text)
         if not 0.25 <= hours <= 72:
-            return await ui.show(update, context, texts.ERR_DURATION, kb.back("adm_plan"))
-        db.set_setting("duration", str(hours))
+            msg = texts.ERR_DURATION if state == "await_duration" else texts.ERR_DURATION.replace("Envoie une durée", "Envoie une pause")
+            return await ui.show(update, context, msg, kb.back("adm_plan"))
+        db.set_setting("duration" if state == "await_duration" else "pause", str(hours))
         return await _planning(update, context)
 
     if state == "await_sp_label":
@@ -1165,6 +1362,22 @@ async def handle_input(update, context):
         db.add_extra(context.user_data.pop("sp_label", "⭐ Sponsor ⭐"), link)
         context.application.create_task(cross.sync_all(context.bot))
         return await _sponsors(update, context)
+
+
+@admin_only
+async def on_mode(update, context):
+    await ui.ack(update, "Mode changé ✅")
+    db.set_setting("mode", "daily" if cross.get_mode() == "cycle" else "cycle")
+    if cross.schedule_on():
+        context.application.create_task(cross.end_cycle(context.bot, restart_now=True))
+    await _planning(update, context)
+
+
+@admin_only
+async def on_pause_ask(update, context):
+    await ui.ack(update)
+    context.user_data["state"] = "await_pause"
+    await ui.show(update, context, texts.PAUSE_ASK, kb.back("adm_plan"))
 '''
 _SOURCES['botcommands'] = r'''"""Menu des commandes (bouton « Menu » à côté de la zone de saisie). Les commandes admin ne sont visibles que par les admins."""
 import logging
@@ -1207,6 +1420,7 @@ async def setup(bot):
         await for_admin(bot, admin_id)
 '''
 _SOURCES['my_channels'] = r'''import html
+import math
 
 import config, cross, db, keyboards as kb, texts, ui
 
@@ -1219,14 +1433,20 @@ def _owned(ch, uid):
 
 async def on_mine(update, context):
     await ui.ack(update)
-    await show_mine(update, context)
+    await show_mine(update, context, ui.page_of(update, "mine"))
 
 
-async def show_mine(update, context):
-    channels = db.owner_channels(update.effective_user.id)
-    if not channels:
+async def show_mine(update, context, page=0):
+    allc = db.owner_channels(update.effective_user.id)
+    if not allc:
         return await ui.show(update, context, texts.NO_CHANNELS, kb.back())
-    await ui.show(update, context, texts.MINE, kb.my_channels(channels))
+    pages = max(1, math.ceil(len(allc) / ui.PAGE_SIZE))
+    page = min(max(page, 0), pages - 1)
+    chunk = allc[page * ui.PAGE_SIZE:(page + 1) * ui.PAGE_SIZE]
+    text = texts.MINE
+    if pages > 1:
+        text += f"\n\n📄 Page {page + 1}/{pages}  ·  {len(allc)} canaux"
+    await ui.show(update, context, text, kb.my_channels(chunk, page, pages))
 
 
 async def _detail(update, context, ch):
@@ -1263,7 +1483,7 @@ async def on_toggle_publish(update, context):
     new = 0 if ch.get("publish") != 0 else 1
     db.set_publish(ch["id"], new)
     if new:
-        context.application.create_task(cross.sync_all(context.bot))
+        context.application.create_task(cross.sync_touched(context.bot, {ch.get("grp")}))
     else:
         context.application.create_task(cross.drop_message(context.bot, ch))
     await ui.ack(update, "Publication activée ✅" if new else "Publication désactivée 🚫")
@@ -1469,7 +1689,7 @@ def main():
     app.add_handler(cb(start.on_menu, pattern=r"^(menu|help)$"))
     app.add_handler(cb(add_channel.on_add, pattern=r"^add$"))
     app.add_handler(cb(add_channel.on_confirm, pattern=r"^confirm_(add|nopub)$"))
-    app.add_handler(cb(my_channels.on_mine, pattern=r"^mine$"))
+    app.add_handler(cb(my_channels.on_mine, pattern=r"^mine(:\d+)?$"))
     app.add_handler(cb(my_channels.on_channel, pattern=r"^ch:-?\d+$"))
     app.add_handler(cb(my_channels.on_toggle_publish, pattern=r"^pub:-?\d+$"))
     app.add_handler(cb(my_channels.on_delete_ask, pattern=r"^del:-?\d+$"))
@@ -1482,6 +1702,8 @@ def main():
     app.add_handler(cb(admin.on_sync, pattern=r"^adm_sync$"))
     app.add_handler(cb(admin_tools.on_planning, pattern=r"^adm_plan$"))
     app.add_handler(cb(admin_tools.on_toggle, pattern=r"^adm_plan_toggle$"))
+    app.add_handler(cb(admin_tools.on_mode, pattern=r"^adm_plan_mode$"))
+    app.add_handler(cb(admin_tools.on_pause_ask, pattern=r"^adm_plan_pause$"))
     app.add_handler(cb(admin_tools.on_times_ask, pattern=r"^adm_plan_times$"))
     app.add_handler(cb(admin_tools.on_duration_ask, pattern=r"^adm_plan_duration$"))
     app.add_handler(cb(admin_tools.on_now, pattern=r"^adm_plan_now$"))
@@ -1491,7 +1713,7 @@ def main():
     app.add_handler(cb(admin_tools.on_sp_del, pattern=r"^spdel:\d+$"))
     app.add_handler(cb(admin.on_pending, pattern=r"^adm_pending$"))
     app.add_handler(cb(admin.on_decision, pattern=r"^(appr|rej):-?\d+$"))
-    app.add_handler(cb(admin.on_all, pattern=r"^adm_all$"))
+    app.add_handler(cb(admin.on_all, pattern=r"^adm_all(:\d+)?$"))
     app.add_handler(cb(admin.on_admin_delete, pattern=r"^admdel:-?\d+$"))
 
     app.add_handler(MessageHandler(private & ~filters.COMMAND, router.on_message))
