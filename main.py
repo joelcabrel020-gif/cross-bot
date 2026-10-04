@@ -318,6 +318,7 @@ def users_stats():
         "new": _q("SELECT COUNT(*) AS n FROM users WHERE first_seen >= :t", t=since)[0]["n"],
         "blocked": _q("SELECT COUNT(*) AS n FROM users WHERE blocked=1")[0]["n"],
         "optout": _q("SELECT COUNT(*) AS n FROM users WHERE optout=1")[0]["n"],
+        "unnamed": _q("SELECT COUNT(*) AS n FROM users WHERE name IS NULL")[0]["n"],
     }
 
 
@@ -345,6 +346,15 @@ def owners_missing():
 
 def set_optout(uid, value):
     _x("UPDATE users SET optout=:v WHERE id=:i", v=value, i=uid)
+
+
+def users_without_name():
+    return [r["id"] for r in _q("SELECT id FROM users WHERE name IS NULL ORDER BY id")]
+
+
+def set_profile(uid, name, username):
+    """Met à jour nom et @ sans toucher aux autres réglages (bloqué, désabonné...)."""
+    _x("UPDATE users SET name=COALESCE(:n, name), username=:u WHERE id=:i", n=name, u=username, i=uid)
 '''
 _SOURCES['texts'] = r'''LINE = "━━━━━━━━━━━━━━━"
 
@@ -535,6 +545,12 @@ PREMIUM_PACK_ASK = (
     "(il ressemble à <code>t.me/addemoji/NomDuPack</code>) et envoie-le ici."
 )
 PREMIUM_ERR = "⚠️ Pack introuvable, ou ce n'est pas un pack d'<b>emojis premium</b>. Envoie un lien <code>t.me/addemoji/…</code>."
+
+NAMES_DONE = (
+    "✅ <b>Noms actualisés</b>\n" + LINE + "\n\n"
+    "👤 Récupérés : <b>{ok}</b> sur <b>{n}</b>\n\n"
+    "<i>Ceux qui n'ont jamais écrit au bot restent « Sans nom » jusqu'à leur première action.</i>"
+)
 '''
 _SOURCES['premium'] = r'''"""Emojis premium : remplacement automatique dans les messages privés du bot quand le compte Premium l'utilise.
 Telegram n'autorise pas les emojis premium d'un bot dans les canaux : la cross publiée garde les emojis normaux."""
@@ -831,8 +847,11 @@ def sponsors(extras):
     return M(rows)
 
 
-def users_page(page=0, pages=1):
-    return M(_nav("adm_users", page, pages) + [[B("⬅️  Retour", "admin")]])
+def users_page(page=0, pages=1, unnamed=0):
+    rows = _nav("adm_users", page, pages)
+    if unnamed:
+        rows.append([B(f"🔄  Actualiser les noms ({unnamed})", "adm_users_refresh", "primary")])
+    return M(rows + [[B("⬅️  Retour", "admin")]])
 
 
 def bc_confirm():
@@ -2085,6 +2104,10 @@ def _date(value):
 @admin_only
 async def on_users(update, context):
     await ui.ack(update)
+    await _users_view(update, context)
+
+
+async def _users_view(update, context):
     stats = db.users_stats()
     total = stats["total"]
     if not total:
@@ -2107,7 +2130,7 @@ async def on_users(update, context):
         total=total, new=stats["new"], blocked=stats["blocked"], optout=stats["optout"],
         items="\n\n".join(items), page=page + 1, pages=pages,
     )
-    await ui.show(update, context, text, kb.users_page(page, pages))
+    await ui.show(update, context, text, kb.users_page(page, pages, stats["unnamed"]))
 
 
 # ------------------------------------------------------------------ message à tous
@@ -2187,6 +2210,46 @@ async def on_ann_on(update, context):
     db.add_user(update.effective_user.id)
     db.set_optout(update.effective_user.id, 0)
     await ui.show(update, context, texts.RESUB, kb.back("menu"))
+
+
+# ------------------------------------------------------------------ actualiser les noms des « Sans nom »
+async def refresh_names(bot, ids):
+    """Demande à Telegram le nom et le @ de chaque identifiant. Retourne le nombre de noms récupérés."""
+    ok = 0
+    for uid in ids:
+        try:
+            chat = await bot.get_chat(uid)
+            name = _full_name(chat.first_name, chat.last_name)
+            db.set_profile(uid, name, chat.username)
+            ok += 1 if name else 0
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramError:
+            pass  # n'a jamais écrit au bot : Telegram ne donne rien
+        await asyncio.sleep(0.1)
+    return ok
+
+
+async def _refresh_report(bot, admin_id, ids):
+    ok = await refresh_names(bot, ids)
+    try:
+        await bot.send_message(admin_id, texts.NAMES_DONE.format(ok=ok, n=len(ids)), parse_mode="HTML")
+    except TelegramError:
+        pass
+
+
+@admin_only
+async def on_users_refresh(update, context):
+    ids = db.users_without_name()
+    if not ids:
+        return await ui.ack(update, "Tous les noms sont déjà à jour ✅", show_alert=True)
+    if len(ids) > 60:  # beaucoup de monde : en arrière-plan, avec un bilan à la fin
+        await ui.ack(update, "Actualisation lancée, tu recevras un bilan 📤", show_alert=True)
+        context.application.create_task(_refresh_report(context.bot, update.effective_user.id, ids))
+        return
+    ok = await refresh_names(context.bot, ids)
+    await ui.ack(update, f"{ok} noms récupérés sur {len(ids)} ✅")
+    await _users_view(update, context)
 '''
 _SOURCES['commands'] = r'''"""Commandes du menu : ouvrent directement le bon écran."""
 import functools
@@ -2497,6 +2560,7 @@ def main():
     app.add_handler(cb(premium_admin.on_premium, pattern=r"^adm_premium$"))
     app.add_handler(cb(premium_admin.on_premium_mode, pattern=r"^adm_premium_mode$"))
     app.add_handler(cb(premium_admin.on_pack_ask, pattern=r"^adm_premium_pack$"))
+    app.add_handler(cb(users.on_users_refresh, pattern=r"^adm_users_refresh$"))
     app.add_handler(cb(users.on_users, pattern=r"^adm_users(:\d+)?$"))
     app.add_handler(cb(users.on_bc_ask, pattern=r"^adm_bc$"))
     app.add_handler(cb(users.on_bc_go, pattern=r"^bc_go$"))
