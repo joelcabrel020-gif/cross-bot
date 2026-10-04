@@ -139,13 +139,28 @@ def count_users():
     return _q("SELECT COUNT(*) AS n FROM users")[0]["n"]
 
 
+# Réglages gardés en mémoire : le bot lit la base une seule fois, puis seulement quand un réglage change.
+# Ainsi le planning (qui vérifie l'heure chaque minute) ne réveille plus Neon en permanence :
+# la base peut se mettre en veille entre deux diffusions et reste dans l'offre gratuite.
+_settings = None
+
+
+def _load_settings():
+    global _settings
+    _settings = {r["k"]: r["v"] for r in _q("SELECT k, v FROM settings")}
+
+
 def get_setting(key, default=None):
-    r = _q("SELECT v FROM settings WHERE k=:k", k=key)
-    return r[0]["v"] if r else default
+    if _settings is None:
+        _load_settings()
+    value = _settings.get(key)
+    return default if value is None else value
 
 
 def set_setting(key, value):
     _x("INSERT INTO settings (k, v) VALUES (:k, :v) ON CONFLICT (k) DO UPDATE SET v=:v", k=key, v=value)
+    if _settings is not None:
+        _settings[key] = value
 
 
 # ---- canaux
