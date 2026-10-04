@@ -91,7 +91,15 @@ SCHEMA = [
     )""",
     "CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)",
     "CREATE TABLE IF NOT EXISTS extras (id BIGINT PRIMARY KEY, label TEXT NOT NULL, link TEXT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS users (id BIGINT PRIMARY KEY, first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    """CREATE TABLE IF NOT EXISTS users (
+        id BIGINT PRIMARY KEY,
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        name TEXT,
+        username TEXT,
+        last_seen TIMESTAMP,
+        blocked INTEGER NOT NULL DEFAULT 0,
+        optout INTEGER NOT NULL DEFAULT 0
+    )""",
 ]
 
 
@@ -114,11 +122,17 @@ def init():
         _x("ALTER TABLE channels ADD COLUMN publish INTEGER NOT NULL DEFAULT 1")
     if "grp" not in cols:
         _x("ALTER TABLE channels ADD COLUMN grp INTEGER")
+    # anciennes bases : colonnes ajoutées à la table des utilisateurs
+    ucols = {c["name"] for c in inspect(engine).get_columns("users")}
+    for col, ddl in (("name", "TEXT"), ("username", "TEXT"), ("last_seen", "TIMESTAMP"), ("blocked", "INTEGER NOT NULL DEFAULT 0"), ("optout", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in ucols:
+            _x(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
 
 
 # ---- utilisateurs / réglages
-def add_user(uid):
-    _x("INSERT INTO users (id) VALUES (:i) ON CONFLICT (id) DO NOTHING", i=uid)
+def add_user(uid, name=None, username=None):
+    """Enregistre l'identifiant s'il manque (nom et @ sont mis à jour par touch_user)."""
+    _x("INSERT INTO users (id, last_seen) VALUES (:i, CURRENT_TIMESTAMP) ON CONFLICT (id) DO NOTHING", i=uid)
 
 
 def count_users():
@@ -249,7 +263,8 @@ def export_backup():
     settings = {k: get_setting(k) for k in _BACKUP_KEYS if get_setting(k) is not None}
     channels = _q("SELECT id, owner_id, title, link, members, status, publish FROM channels ORDER BY added_at, id")
     extras = [{"label": e["label"], "link": e["link"]} for e in list_extras()]
-    return {"version": 1, "channels": channels, "extras": extras, "settings": settings}
+    users = _q("SELECT id, name, username FROM users ORDER BY first_seen, id")
+    return {"version": 1, "channels": channels, "extras": extras, "settings": settings, "users": users}
 
 
 def restore_backup(data):
@@ -269,135 +284,67 @@ def restore_backup(data):
                 add_extra(str(e["label"])[:40], str(e["link"]))
                 n_ex += 1
                 time.sleep(0.002)  # identifiants uniques
+    for u in data.get("users", []):
+        try:
+            touch_user(int(u["id"]), u.get("name"), u.get("username"))
+        except (KeyError, ValueError, TypeError):
+            continue
     for k, v in (data.get("settings") or {}).items():
         if k in _BACKUP_KEYS and v is not None:
             set_setting(k, str(v))
     return n_ch, n_ex
-'''
-_SOURCES['keyboards'] = r'''from telegram import InlineKeyboardButton as _B
-from telegram import InlineKeyboardMarkup as M
-
-_ICON = {"active": "🟢", "pending": "⏳", "lost": "⚠️"}
 
 
-def B(text, data=None, style=None, url=None):
-    """Bouton inline (action ou lien). style : 'primary' (bleu), 'success' (vert), 'danger' (rouge)."""
-    kw = {"api_kwargs": {"style": style}} if style else {}
-    if url:
-        return _B(text, url=url, **kw)
-    return _B(text, callback_data=data, **kw)
+# ---- utilisateurs : qui utilise le bot
+def touch_user(uid, name=None, username=None):
+    _x(
+        """INSERT INTO users (id, name, username, last_seen, blocked)
+           VALUES (:i, :n, :u, CURRENT_TIMESTAMP, 0)
+           ON CONFLICT (id) DO UPDATE SET name=COALESCE(:n, users.name), username=:u,
+           last_seen=CURRENT_TIMESTAMP, blocked=0""",
+        i=uid, n=name, u=username,
+    )
 
 
-def icon(status):
-    return _ICON.get(status, "•")
+def list_users_page(offset, limit):
+    return _q("SELECT * FROM users ORDER BY first_seen DESC, id DESC LIMIT :l OFFSET :o", l=limit, o=offset)
 
 
-def menu(is_admin=False):
-    rows = [
-        [B("➕  Ajouter mon canal", "add", "primary")],
-        [B("📂  Mes canaux", "mine"), B("ℹ️  Aide", "help")],
-    ]
-    if is_admin:
-        rows.append([B("🛠  Panneau admin", "admin")])
-    return M(rows)
+def users_stats():
+    from datetime import datetime, timedelta, timezone
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
+    return {
+        "total": _q("SELECT COUNT(*) AS n FROM users")[0]["n"],
+        "new": _q("SELECT COUNT(*) AS n FROM users WHERE first_seen >= :t", t=since)[0]["n"],
+        "blocked": _q("SELECT COUNT(*) AS n FROM users WHERE blocked=1")[0]["n"],
+        "optout": _q("SELECT COUNT(*) AS n FROM users WHERE optout=1")[0]["n"],
+    }
 
 
-def back(target="menu"):
-    return M([[B("⬅️  Retour", target)]])
+def list_reachable_ids():
+    return [r["id"] for r in _q("SELECT id FROM users WHERE blocked=0 AND optout=0 ORDER BY id")]
 
 
-def cancel():
-    return M([[B("✖️  Annuler", "menu", "danger")]])
+def count_reachable():
+    return _q("SELECT COUNT(*) AS n FROM users WHERE blocked=0 AND optout=0")[0]["n"]
 
 
-def confirm(is_admin=False):
-    if is_admin:
-        return M([
-            [B("✅  Oui, publier la cross ici", "confirm_add", "success")],
-            [B("🚫  Non, juste dans la liste", "confirm_nopub")],
-            [B("✖️  Annuler", "menu", "danger")],
-        ])
-    return M([[B("✅  Confirmer", "confirm_add", "success"), B("✖️  Annuler", "menu", "danger")]])
+def mark_blocked(uid):
+    _x("UPDATE users SET blocked=1 WHERE id=:i", i=uid)
 
 
-def _nav(prefix, page, pages):
-    nav = []
-    if page > 0:
-        nav.append(B("◀️  Précédent", f"{prefix}:{page - 1}"))
-    if page < pages - 1:
-        nav.append(B("Suivant  ▶️", f"{prefix}:{page + 1}"))
-    return [nav] if nav else []
+def owners_missing():
+    """Propriétaires de canaux que le bot ne connaît pas encore comme utilisateurs (ou sans nom)."""
+    rows = _q(
+        """SELECT DISTINCT c.owner_id AS id FROM channels c
+           LEFT JOIN users u ON u.id = c.owner_id
+           WHERE u.id IS NULL OR u.name IS NULL"""
+    )
+    return [r["id"] for r in rows]
 
 
-def my_channels(channels, page=0, pages=1):
-    rows = [[B(f"{icon(c['status'])}  {c['title'][:35]}", f"ch:{c['id']}")] for c in channels]
-    rows += _nav("mine", page, pages)
-    rows.append([B("⬅️  Retour", "menu")])
-    return M(rows)
-
-
-def channel_detail(cid, is_admin=False, publish=True):
-    rows = []
-    if is_admin:
-        rows.append([B("📢  Publication : activée" if publish else "🚫  Publication : désactivée", f"pub:{cid}")])
-    rows.append([B("🗑  Retirer de la cross", f"del:{cid}", "danger")])
-    rows.append([B("⬅️  Retour", "mine")])
-    return M(rows)
-
-
-def delete_confirm(cid):
-    return M([[B("🗑  Oui, retirer", f"delok:{cid}", "danger"), B("↩️  Non", f"ch:{cid}")]])
-
-
-def admin(pending, approval=False):
-    return M([
-        [B("✏️  Texte", "adm_text"), B("🖼  Photo", "adm_photo")],
-        [B("⏰  Planning", "adm_plan", "primary"), B("⭐  Sponsors", "adm_sp")],
-        [B("🔄  Synchroniser", "adm_sync"), B(f"⏳  En attente ({pending})", "adm_pending")],
-        [B("📋  Tous les canaux", "adm_all"), B("🔐  Validation : ON" if approval else "🔓  Validation : OFF", "adm_approval")],
-        [B("💾  Sauvegarde", "adm_backup"), B("♻️  Restaurer", "adm_restore")],
-        [B("⬅️  Menu", "menu")],
-    ])
-
-
-def pending_list(channels):
-    rows = [[B(f"✅  {c['title'][:25]}", f"appr:{c['id']}", "success"), B("❌", f"rej:{c['id']}", "danger")] for c in channels]
-    rows.append([B("⬅️  Retour", "admin")])
-    return M(rows)
-
-
-def all_list(channels, page=0, pages=1):
-    rows = [[B(f"🗑  {c['title'][:35]}", f"admdel:{c['id']}")] for c in channels]
-    rows += _nav("adm_all", page, pages)
-    rows.append([B("⬅️  Retour", "admin")])
-    return M(rows)
-
-
-def approve_reject(cid):
-    return M([[B("✅  Accepter", f"appr:{cid}", "success"), B("❌  Refuser", f"rej:{cid}", "danger")]])
-
-
-def photo_menu():
-    return M([[B("🗑  Retirer la photo", "adm_photo_del", "danger")], [B("⬅️  Retour", "admin")]])
-
-
-def planning(on, mode="cycle"):
-    cycle = mode == "cycle"
-    return M([
-        [B("🔴  Désactiver le planning", "adm_plan_toggle", "danger") if on else B("🟢  Activer le planning", "adm_plan_toggle", "success")],
-        [B("🔁  Mode : répétition" if cycle else "📅  Mode : horaires fixes", "adm_plan_mode")],
-        [B("⏳  Durée", "adm_plan_duration"), B("⏸  Pause", "adm_plan_pause")] if cycle
-        else [B("🕒  Horaires", "adm_plan_times"), B("⏳  Durée", "adm_plan_duration")],
-        [B("🚀  Publier maintenant", "adm_plan_now", "success"), B("🛑  Retirer maintenant", "adm_plan_stop", "danger")],
-        [B("⬅️  Retour", "admin")],
-    ])
-
-
-def sponsors(extras):
-    rows = [[B(f"🗑  {e['label'][:35]}", f"spdel:{e['id']}")] for e in extras]
-    rows.append([B("➕  Ajouter un sponsor", "adm_sp_add", "success")])
-    rows.append([B("⬅️  Retour", "admin")])
-    return M(rows)
+def set_optout(uid, value):
+    _x("UPDATE users SET optout=:v WHERE id=:i", v=value, i=uid)
 '''
 _SOURCES['texts'] = r'''LINE = "━━━━━━━━━━━━━━━"
 
@@ -544,11 +491,371 @@ RESTORE_ASK = (
 RESTORED = "✅ <b>Sauvegarde restaurée</b>\n" + LINE + "\n\n📣 {n} canaux\n⭐ {s} sponsors\n\nLa cross se met à jour."
 ERR_BACKUP = "⚠️ Fichier illisible. Envoie le fichier <b>.json</b> de sauvegarde."
 NO_BACKUP = "⚠️ Aucun canal à sauvegarder pour le moment."
+
+USERS = (
+    "👥 <b>UTILISATEURS</b>\n" + LINE + "\n\n"
+    "👤 Total : <b>{total}</b>\n"
+    "🆕 Nouveaux (24 h) : <b>{new}</b>\n"
+    "🚫 Ont bloqué le bot : <b>{blocked}</b>\n"
+    "🔕 Désabonnés des annonces : <b>{optout}</b>\n\n"
+    "{items}\n\n"
+    "📄 Page {page}/{pages}"
+)
+USERS_EMPTY = "👥 <b>UTILISATEURS</b>\n" + LINE + "\n\nAucun utilisateur enregistré pour le moment."
+USER_ITEM = "👤 <b>{name}</b> {username}\n🆔 <code>{id}</code>  ·  📅 {date}  ·  {chans}"
+BC_ASK = (
+    "📢 <b>Message à tous</b>\n" + LINE + "\n\n"
+    "Envoie-moi le message à diffuser : un texte (mise en forme conservée), ou une photo avec légende.\n\n"
+    "👥 Il sera envoyé à <b>{n}</b> personnes."
+)
+BC_CONFIRM = "👆 <b>Voici le message qui sera envoyé.</b>\n\n👥 Destinataires : <b>{n}</b>\n\nConfirmer l'envoi ?"
+BC_SENDING = "📤 <b>Envoi en cours…</b>\n\nTu recevras un bilan à la fin."
+BC_DONE = "✅ <b>Envoi terminé</b>\n" + LINE + "\n\n📬 Reçu : <b>{ok}</b>\n🚫 Ont bloqué le bot : <b>{blocked}</b>\n⚠️ Échecs : <b>{failed}</b>"
+BC_NONE = "⚠️ Aucun utilisateur à qui envoyer pour le moment."
+
+UNSUB = (
+    "🔕 <b>Annonces désactivées</b>\n" + LINE + "\n\n"
+    "Tu ne recevras plus les messages d'information du bot.\n"
+    "Tes canaux et la cross ne changent pas.\n\n"
+    "Tu peux les réactiver quand tu veux."
+)
+RESUB = "🔔 <b>Annonces réactivées</b>\n" + LINE + "\n\nTu recevras de nouveau les messages d'information du bot."
+
+PREMIUM = (
+    "💎 <b>Emojis premium</b>\n" + LINE + "\n\n"
+    "📌 Statut : {status}\n"
+    "📦 Pack : <b>{pack}</b>\n"
+    "🎯 Couverture : <b>{cov}</b>\n\n"
+    "<i>Dès que ton compte Premium utilise le bot, ses emojis deviennent premium tout seuls. "
+    "Les canaux gardent les emojis normaux : Telegram ne l'autorise pas dans les canaux.</i>"
+)
+PREMIUM_PACK_ASK = (
+    "📦 <b>Choisir un pack d'emojis premium</b>\n" + LINE + "\n\n"
+    "Dans Telegram, ouvre un pack d'emojis premium qui te plaît, copie son lien "
+    "(il ressemble à <code>t.me/addemoji/NomDuPack</code>) et envoie-le ici."
+)
+PREMIUM_ERR = "⚠️ Pack introuvable, ou ce n'est pas un pack d'<b>emojis premium</b>. Envoie un lien <code>t.me/addemoji/…</code>."
+'''
+_SOURCES['premium'] = r'''"""Emojis premium : remplacement automatique dans les messages privés du bot quand le compte Premium l'utilise.
+Telegram n'autorise pas les emojis premium d'un bot dans les canaux : la cross publiée garde les emojis normaux."""
+import json
+import logging
+import re
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError
+
+import db, texts
+
+log = logging.getLogger(__name__)
+
+MAP = {}            # emoji -> identifiant de l'emoji premium
+REVERSE = {}        # identifiant -> emoji
+PACK = ""
+MODE = "auto"       # "auto" ou "off"
+OWNER_PREMIUM = False
+VERIFIED = False
+_probed = False
+_probing = False
+_RE = None
+_EMOJI = re.compile(
+    "[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B50\u2B55\u2B05-\u2B07\u231A\u231B\u23E9-\u23FA"
+    "\u2194-\u21AA\u25AA-\u25FE\u2139\u203C\u2049]\ufe0f?"
+)
+
+
+def _norm(e):
+    return e.replace("\ufe0f", "")
+
+
+def set_map(mapping):
+    global MAP, REVERSE, _RE
+    MAP = {_norm(k): str(v) for k, v in (mapping or {}).items() if _norm(k)}
+    REVERSE = {v: k for k, v in MAP.items()}
+    _RE = re.compile("(" + "|".join(re.escape(k) for k in sorted(MAP, key=len, reverse=True)) + ")\ufe0f?") if MAP else None
+
+
+def load():
+    """Au démarrage : relit le pack choisi et le mode."""
+    global MODE, PACK
+    try:
+        MODE = "off" if db.get_setting("premium_mode") == "off" else "auto"
+        PACK = db.get_setting("emoji_pack", "") or ""
+        raw = db.get_setting("emoji_map", "") or ""
+        set_map(json.loads(raw) if raw else {})
+    except Exception:
+        log.exception("Emojis premium : chargement impossible")
+
+
+def active():
+    return MODE != "off" and OWNER_PREMIUM and VERIFIED and bool(MAP)
+
+
+def disable(reason=""):
+    global VERIFIED
+    VERIFIED = False
+    log.warning("Emojis premium désactivés : %s", reason)
+
+
+def apply(text):
+    """Remplace les emojis du pack par leur version premium."""
+    if not active() or not _RE:
+        return text
+    return _RE.sub(lambda m: f'<tg-emoji emoji-id="{MAP[m.group(1)]}">{m.group(0)}</tg-emoji>', text)
+
+
+def icon_and_text(text):
+    """Pour un bouton : (identifiant d'emoji premium, texte sans l'emoji de début)."""
+    if not active() or not _RE:
+        return None, text
+    m = _RE.match(text)
+    if not m:
+        return None, text
+    rest = text[m.end():].lstrip()
+    if not rest:
+        return None, text
+    return MAP[m.group(1)], rest
+
+
+def plain_markup(kb):
+    """Clavier sans emojis premium (secours si Telegram les refuse)."""
+    if kb is None or not hasattr(kb, "inline_keyboard"):
+        return kb
+    rows, changed = [], False
+    for row in kb.inline_keyboard:
+        new = []
+        for b in row:
+            extra = dict(getattr(b, "api_kwargs", None) or {})
+            icon = extra.pop("icon_custom_emoji_id", None)
+            text = b.text
+            if icon:
+                changed = True
+                text = f"{REVERSE.get(icon, '')} {text}".strip()
+            new.append(InlineKeyboardButton(text, callback_data=b.callback_data, url=b.url, api_kwargs=extra or None))
+        rows.append(new)
+    return InlineKeyboardMarkup(rows) if changed else kb
+
+
+async def probe(bot, chat_id):
+    """Test réel : un message avec un emoji premium et un bouton à icône, envoyé puis supprimé aussitôt."""
+    if not MAP:
+        return False
+    emoji, cid = next(iter(MAP.items()))
+    try:
+        m = await bot.send_message(
+            chat_id, f'<tg-emoji emoji-id="{cid}">{emoji}</tg-emoji>', parse_mode="HTML", disable_notification=True,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("·", callback_data="noop", api_kwargs={"icon_custom_emoji_id": cid})]]),
+        )
+        await bot.delete_message(chat_id, m.message_id)
+        return True
+    except TelegramError as e:
+        log.info("Emojis premium refusés par Telegram : %s", e)
+        return False
+
+
+async def reprobe(bot, chat_id):
+    global VERIFIED, _probed
+    VERIFIED = await probe(bot, chat_id)
+    _probed = True
+    return VERIFIED
+
+
+async def _probe_task(bot, chat_id):
+    global _probing
+    try:
+        await reprobe(bot, chat_id)
+    finally:
+        _probing = False
+
+
+def on_owner_seen(is_premium, app, bot, chat_id):
+    """Appelé quand un admin parle au bot : détecte son Premium et vérifie (une fois) que Telegram accepte les emojis."""
+    global OWNER_PREMIUM, _probing
+    OWNER_PREMIUM = bool(is_premium)
+    if OWNER_PREMIUM and MAP and not _probed and not _probing:
+        _probing = True
+        app.create_task(_probe_task(bot, chat_id))
+
+
+def coverage():
+    """(emojis du bot couverts par le pack, emojis différents utilisés par le bot)."""
+    used = set()
+    for name in dir(texts):
+        v = getattr(texts, name)
+        if name.isupper() and isinstance(v, str):
+            used |= {_norm(m.group(0)) for m in _EMOJI.finditer(v)}
+    return len(used & set(MAP)), len(used)
+
+
+def status():
+    if not MAP:
+        return "⚪ Inactif — aucun pack choisi"
+    if MODE == "off":
+        return "⚪ Désactivé"
+    if not OWNER_PREMIUM:
+        return "⚪ En attente — ouvre le bot avec ton compte Premium"
+    if not VERIFIED:
+        return "⚪ Refusé ou en cours de vérification — réessaie avec le bouton Activer"
+    return "🟢 Actif"
+'''
+_SOURCES['keyboards'] = r'''from telegram import InlineKeyboardButton as _B
+from telegram import InlineKeyboardMarkup as M
+
+import premium
+
+_ICON = {"active": "🟢", "pending": "⏳", "lost": "⚠️"}
+
+
+def B(text, data=None, style=None, url=None):
+    """Bouton inline (action ou lien). style : 'primary' (bleu), 'success' (vert), 'danger' (rouge)."""
+    extra = {"style": style} if style else {}
+    if url:
+        return _B(text, url=url, **({"api_kwargs": extra} if extra else {}))
+    icon_id, text = premium.icon_and_text(text)  # emoji premium en début de bouton (si disponible)
+    if icon_id:
+        extra["icon_custom_emoji_id"] = icon_id
+    return _B(text, callback_data=data, **({"api_kwargs": extra} if extra else {}))
+
+
+def icon(status):
+    return _ICON.get(status, "•")
+
+
+def menu(is_admin=False):
+    rows = [
+        [B("➕  Ajouter mon canal", "add", "primary")],
+        [B("📂  Mes canaux", "mine"), B("ℹ️  Aide", "help")],
+    ]
+    if is_admin:
+        rows.append([B("🛠  Panneau admin", "admin")])
+    return M(rows)
+
+
+def back(target="menu"):
+    return M([[B("⬅️  Retour", target)]])
+
+
+def cancel():
+    return M([[B("✖️  Annuler", "menu", "danger")]])
+
+
+def confirm(is_admin=False):
+    if is_admin:
+        return M([
+            [B("✅  Oui, publier la cross ici", "confirm_add", "success")],
+            [B("🚫  Non, juste dans la liste", "confirm_nopub")],
+            [B("✖️  Annuler", "menu", "danger")],
+        ])
+    return M([[B("✅  Confirmer", "confirm_add", "success"), B("✖️  Annuler", "menu", "danger")]])
+
+
+def _nav(prefix, page, pages):
+    nav = []
+    if page > 0:
+        nav.append(B("◀️  Précédent", f"{prefix}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(B("Suivant  ▶️", f"{prefix}:{page + 1}"))
+    return [nav] if nav else []
+
+
+def my_channels(channels, page=0, pages=1):
+    rows = [[B(f"{icon(c['status'])}  {c['title'][:35]}", f"ch:{c['id']}")] for c in channels]
+    rows += _nav("mine", page, pages)
+    rows.append([B("⬅️  Retour", "menu")])
+    return M(rows)
+
+
+def channel_detail(cid, is_admin=False, publish=True):
+    rows = []
+    if is_admin:
+        rows.append([B("📢  Publication : activée" if publish else "🚫  Publication : désactivée", f"pub:{cid}")])
+    rows.append([B("🗑  Retirer de la cross", f"del:{cid}", "danger")])
+    rows.append([B("⬅️  Retour", "mine")])
+    return M(rows)
+
+
+def delete_confirm(cid):
+    return M([[B("🗑  Oui, retirer", f"delok:{cid}", "danger"), B("↩️  Non", f"ch:{cid}")]])
+
+
+def admin(pending, approval=False):
+    return M([
+        [B("✏️  Texte", "adm_text"), B("🖼  Photo", "adm_photo")],
+        [B("⏰  Planning", "adm_plan", "primary"), B("⭐  Sponsors", "adm_sp")],
+        [B("🔄  Synchroniser", "adm_sync"), B(f"⏳  En attente ({pending})", "adm_pending")],
+        [B("📋  Tous les canaux", "adm_all"), B("🔐  Validation : ON" if approval else "🔓  Validation : OFF", "adm_approval")],
+        [B("👥  Utilisateurs", "adm_users"), B("📢  Message à tous", "adm_bc")],
+        [B("💎  Emojis premium", "adm_premium")],
+        [B("💾  Sauvegarde", "adm_backup"), B("♻️  Restaurer", "adm_restore")],
+        [B("⬅️  Menu", "menu")],
+    ])
+
+
+def pending_list(channels):
+    rows = [[B(f"✅  {c['title'][:25]}", f"appr:{c['id']}", "success"), B("❌", f"rej:{c['id']}", "danger")] for c in channels]
+    rows.append([B("⬅️  Retour", "admin")])
+    return M(rows)
+
+
+def all_list(channels, page=0, pages=1):
+    rows = [[B(f"🗑  {c['title'][:35]}", f"admdel:{c['id']}")] for c in channels]
+    rows += _nav("adm_all", page, pages)
+    rows.append([B("⬅️  Retour", "admin")])
+    return M(rows)
+
+
+def approve_reject(cid):
+    return M([[B("✅  Accepter", f"appr:{cid}", "success"), B("❌  Refuser", f"rej:{cid}", "danger")]])
+
+
+def photo_menu():
+    return M([[B("🗑  Retirer la photo", "adm_photo_del", "danger")], [B("⬅️  Retour", "admin")]])
+
+
+def planning(on, mode="cycle"):
+    cycle = mode == "cycle"
+    return M([
+        [B("🔴  Désactiver le planning", "adm_plan_toggle", "danger") if on else B("🟢  Activer le planning", "adm_plan_toggle", "success")],
+        [B("🔁  Mode : répétition" if cycle else "📅  Mode : horaires fixes", "adm_plan_mode")],
+        [B("⏳  Durée", "adm_plan_duration"), B("⏸  Pause", "adm_plan_pause")] if cycle
+        else [B("🕒  Horaires", "adm_plan_times"), B("⏳  Durée", "adm_plan_duration")],
+        [B("🚀  Publier maintenant", "adm_plan_now", "success"), B("🛑  Retirer maintenant", "adm_plan_stop", "danger")],
+        [B("⬅️  Retour", "admin")],
+    ])
+
+
+def sponsors(extras):
+    rows = [[B(f"🗑  {e['label'][:35]}", f"spdel:{e['id']}")] for e in extras]
+    rows.append([B("➕  Ajouter un sponsor", "adm_sp_add", "success")])
+    rows.append([B("⬅️  Retour", "admin")])
+    return M(rows)
+
+
+def users_page(page=0, pages=1):
+    return M(_nav("adm_users", page, pages) + [[B("⬅️  Retour", "admin")]])
+
+
+def bc_confirm():
+    return M([[B("✅  Envoyer à tous", "bc_go", "success")], [B("✖️  Annuler", "admin", "danger")]])
+
+
+def unsub_menu():
+    return M([[B("🔔  Réactiver les annonces", "ann_on", "success")], [B("⬅️  Menu", "menu")]])
+
+
+def premium_menu(on=True):
+    return M([
+        [B("📦  Choisir un pack d'emojis", "adm_premium_pack", "primary")],
+        [B("🔴  Désactiver", "adm_premium_mode", "danger") if on else B("🟢  Activer", "adm_premium_mode", "success")],
+        [B("⬅️  Retour", "admin")],
+    ])
 '''
 _SOURCES['ui'] = r'''"""Panneau unique : chaque étape édite le même message, les messages de l'utilisateur sont supprimés."""
 from telegram import LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
+
+import premium
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -561,7 +868,7 @@ async def clean(update):
             pass
 
 
-async def show(update, context, text, kb=None):
+async def _show(update, context, text, kb=None):
     kw = dict(parse_mode=ParseMode.HTML, reply_markup=kb, link_preview_options=NO_PREVIEW)
     q = update.callback_query
     if q:
@@ -594,6 +901,17 @@ async def show(update, context, text, kb=None):
     context.user_data["panel"] = (msg.chat_id, msg.message_id)
 
 
+async def show(update, context, text, kb=None):
+    """Affiche le panneau. Avec un compte Premium détecté, les emojis deviennent premium ; si Telegram refuse, retour automatique aux emojis normaux."""
+    if premium.active():
+        try:
+            return await _show(update, context, premium.apply(text), kb)
+        except BadRequest:
+            premium.disable("refusé par Telegram")
+            kb = premium.plain_markup(kb)
+    return await _show(update, context, text, kb)
+
+
 async def ack(update, text=None, show_alert=False):
     """Répond au clic d'un bouton sans jamais planter (même si déjà répondu)."""
     q = update.callback_query
@@ -617,6 +935,30 @@ def page_of(update, prefix):
         except ValueError:
             return 0
     return 0
+
+
+async def _fresh(update, context, text, kb=None):
+    """Supprime l'ancien panneau et en envoie un nouveau tout en bas (sous le message de l'utilisateur)."""
+    panel = context.user_data.pop("panel", None)
+    if panel:
+        try:
+            await context.bot.delete_message(panel[0], panel[1])
+        except TelegramError:
+            pass
+    msg = await context.bot.send_message(
+        update.effective_chat.id, text, parse_mode=ParseMode.HTML, reply_markup=kb, link_preview_options=NO_PREVIEW
+    )
+    context.user_data["panel"] = (msg.chat_id, msg.message_id)
+
+
+async def fresh(update, context, text, kb=None):
+    if premium.active():
+        try:
+            return await _fresh(update, context, premium.apply(text), kb)
+        except BadRequest:
+            premium.disable("refusé par Telegram")
+            kb = premium.plain_markup(kb)
+    return await _fresh(update, context, text, kb)
 '''
 _SOURCES['cross'] = r'''"""Coeur du bot : publication, mise à jour et suppression planifiée de la cross."""
 import asyncio
@@ -1557,6 +1899,7 @@ USER = [
     BotCommand("ajouter", "➕ Ajouter mon canal"),
     BotCommand("canaux", "📂 Mes canaux"),
     BotCommand("aide", "ℹ️ Comment ça marche"),
+    BotCommand("stop", "🔕 Ne plus recevoir les annonces"),
 ]
 ADMIN = USER + [
     BotCommand("admin", "🛠 Panneau admin"),
@@ -1566,6 +1909,7 @@ ADMIN = USER + [
     BotCommand("retirer", "🛑 Retirer maintenant"),
     BotCommand("sauvegarde", "💾 Sauvegarder les canaux"),
     BotCommand("restaurer", "♻️ Restaurer une sauvegarde"),
+    BotCommand("broadcast", "📢 Message à tous les utilisateurs"),
 ]
 
 
@@ -1672,10 +2016,182 @@ async def on_delete_ok(update, context):
         context.application.create_task(cross.remove_channel(context.bot, ch))
     await ui.show(update, context, texts.DELETED, kb.back("mine"))
 '''
+_SOURCES['users'] = r'''"""Utilisateurs du bot (qui l'utilise) et message à tous."""
+import asyncio
+import html
+import logging
+import math
+import time
+
+from telegram.error import Forbidden, RetryAfter, TelegramError
+
+import config, db, keyboards as kb, premium, texts, ui
+from admin import admin_only
+
+log = logging.getLogger(__name__)
+PER_PAGE = 8
+
+
+# ------------------------------------------------------------------ suivi des utilisateurs
+def _full_name(first, last):
+    return " ".join(x for x in (first, last) if x) or None
+
+
+async def track(update, context):
+    """Enregistre en silence toute personne qui parle au bot (démarrage, bouton, message)."""
+    u = update.effective_user
+    chat = update.effective_chat
+    if not u or u.is_bot or not chat or chat.type != "private":
+        return
+    if config.is_admin(u.id):  # compte Premium détecté -> emojis premium (si un pack est choisi)
+        premium.on_owner_seen(bool(getattr(u, "is_premium", False)), context.application, context.bot, chat.id)
+    key = (_full_name(u.first_name, u.last_name), u.username)
+    seen = context.application.bot_data.setdefault("seen", {})
+    prev = seen.get(u.id)
+    now = time.time()
+    if prev and prev[0] == key and now - prev[1] < 600:  # pas plus d'une écriture / 10 min par personne
+        return
+    try:
+        db.touch_user(u.id, key[0], key[1])
+        seen[u.id] = (key, now)
+    except Exception:
+        log.exception("Enregistrement utilisateur impossible")
+
+
+async def backfill_owners(bot):
+    """Au démarrage : ajoute à la liste les propriétaires de canaux déjà inscrits (nom et @ retrouvés auprès de Telegram)."""
+    try:
+        ids = db.owners_missing()
+    except Exception:
+        log.exception("Recherche des propriétaires impossible")
+        return
+    for uid in ids:
+        try:
+            chat = await bot.get_chat(uid)
+            db.touch_user(uid, _full_name(chat.first_name, chat.last_name), chat.username)
+        except TelegramError:
+            db.touch_user(uid, None, None)  # au minimum, l'identifiant est enregistré
+        except Exception:
+            log.exception("Propriétaire %s non ajouté", uid)
+        await asyncio.sleep(0.1)
+
+
+# ------------------------------------------------------------------ section 👥 Utilisateurs
+def _date(value):
+    s = str(value or "")
+    return f"{s[8:10]}/{s[5:7]}/{s[0:4]}" if len(s) >= 10 else "?"
+
+
+@admin_only
+async def on_users(update, context):
+    await ui.ack(update)
+    stats = db.users_stats()
+    total = stats["total"]
+    if not total:
+        return await ui.show(update, context, texts.USERS_EMPTY, kb.users_page())
+    pages = max(1, math.ceil(total / PER_PAGE))
+    page = min(ui.page_of(update, "adm_users"), pages - 1)
+    items = []
+    for u in db.list_users_page(page * PER_PAGE, PER_PAGE):
+        titles = [html.escape(c["title"]) for c in db.owner_channels(u["id"])]
+        if titles:
+            chans = "📣 " + ", ".join(titles[:3]) + (f" (+{len(titles) - 3})" if len(titles) > 3 else "")
+        else:
+            chans = "aucun canal"
+        items.append(texts.USER_ITEM.format(
+            name=html.escape(u.get("name") or "Sans nom"),
+            username=f"@{html.escape(u['username'])}" if u.get("username") else "",
+            id=u["id"], date=_date(u.get("first_seen")), chans=chans,
+        ))
+    text = texts.USERS.format(
+        total=total, new=stats["new"], blocked=stats["blocked"], optout=stats["optout"],
+        items="\n\n".join(items), page=page + 1, pages=pages,
+    )
+    await ui.show(update, context, text, kb.users_page(page, pages))
+
+
+# ------------------------------------------------------------------ message à tous
+async def ask_broadcast(update, context):
+    n = db.count_reachable()
+    if not n:
+        return await ui.show(update, context, texts.BC_NONE, kb.back("admin"))
+    context.user_data["state"] = "await_broadcast"
+    await ui.show(update, context, texts.BC_ASK.format(n=n), kb.back("admin"))
+
+
+@admin_only
+async def on_bc_ask(update, context):
+    await ui.ack(update)
+    await ask_broadcast(update, context)
+
+
+async def handle_broadcast(update, context):
+    """Le message de l'admin (texte, photo...) sert d'aperçu : on le garde et on demande confirmation."""
+    msg = update.message
+    n = db.count_reachable()
+    context.user_data.pop("state", None)
+    if not n:
+        return await ui.show(update, context, texts.BC_NONE, kb.back("admin"))
+    context.user_data["bc"] = (msg.chat_id, msg.message_id)
+    await ui.fresh(update, context, texts.BC_CONFIRM.format(n=n), kb.bc_confirm())
+
+
+@admin_only
+async def on_bc_go(update, context):
+    draft = context.user_data.pop("bc", None)
+    if not draft:
+        await ui.ack(update, "Message introuvable, recommence avec /broadcast", show_alert=True)
+        return
+    await ui.ack(update, "Envoi lancé 📤")
+    context.application.create_task(run_broadcast(context.bot, update.effective_user.id, draft))
+    await ui.show(update, context, texts.BC_SENDING, kb.back("admin"))
+
+
+async def run_broadcast(bot, admin_id, draft):
+    """Copie le message vers chaque utilisateur (environ 20 par seconde) puis envoie un bilan."""
+    ok = blocked = failed = 0
+    for uid in db.list_reachable_ids():
+        for _ in range(2):
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=draft[0], message_id=draft[1])
+                ok += 1
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Forbidden:
+                db.mark_blocked(uid)
+                blocked += 1
+                break
+            except TelegramError:
+                failed += 1
+                break
+        await asyncio.sleep(0.05)
+    try:
+        await bot.send_message(admin_id, texts.BC_DONE.format(ok=ok, blocked=blocked, failed=failed), parse_mode="HTML")
+    except TelegramError:
+        pass
+    return ok, blocked, failed
+
+
+# ------------------------------------------------------------------ /stop : ne plus recevoir les annonces
+async def cmd_unsubscribe(update, context):
+    context.user_data.pop("state", None)
+    db.add_user(update.effective_user.id)
+    db.set_optout(update.effective_user.id, 1)
+    await ui.clean(update)
+    await ui.show(update, context, texts.UNSUB, kb.unsub_menu())
+
+
+async def on_ann_on(update, context):
+    await ui.ack(update, "Annonces réactivées 🔔")
+    db.add_user(update.effective_user.id)
+    db.set_optout(update.effective_user.id, 0)
+    await ui.show(update, context, texts.RESUB, kb.back("menu"))
+'''
 _SOURCES['commands'] = r'''"""Commandes du menu : ouvrent directement le bon écran."""
 import functools
 
-import add_channel, admin, admin_tools, config, cross, db, keyboards as kb, my_channels, texts, ui
+import add_channel, admin, admin_tools, config, cross, db, keyboards as kb, my_channels, texts, ui, users
 
 
 def _admin_cmd(fn):
@@ -1749,6 +2265,11 @@ async def cmd_backup(update, context):
 async def cmd_restore(update, context):
     context.user_data["state"] = "await_backup"
     await ui.show(update, context, texts.RESTORE_ASK, kb.back("admin"))
+
+
+@_admin_cmd
+async def cmd_broadcast(update, context):
+    await users.ask_broadcast(update, context)
 '''
 _SOURCES['health'] = r'''"""Mini serveur HTTP : Render exige un port ouvert, et UptimeRobot peut le pinger."""
 import threading
@@ -1775,8 +2296,80 @@ def start(port: int):
     server = HTTPServer(("0.0.0.0", port), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 '''
+_SOURCES['premium_admin'] = r'''"""Écran admin « 💎 Emojis premium » : choix du pack d'emojis et activation."""
+import html
+import json
+import re
+
+from telegram.error import TelegramError
+
+import config, db, keyboards as kb, premium, texts, ui
+from admin import admin_only
+
+
+async def _view(update, context):
+    context.user_data.pop("state", None)
+    covered, used = premium.coverage()
+    text = texts.PREMIUM.format(
+        status=premium.status(), pack=html.escape(premium.PACK) if premium.PACK else "aucun",
+        cov=f"{covered} sur {used} emojis du bot",
+    )
+    await ui.show(update, context, text, kb.premium_menu(premium.MODE != "off"))
+
+
+@admin_only
+async def on_premium(update, context):
+    await ui.ack(update)
+    await _view(update, context)
+
+
+@admin_only
+async def on_premium_mode(update, context):
+    new_off = premium.MODE != "off"
+    premium.MODE = "off" if new_off else "auto"
+    db.set_setting("premium_mode", premium.MODE)
+    await ui.ack(update, "Emojis premium désactivés" if new_off else "Emojis premium activés 💎")
+    if not new_off and premium.MAP:
+        await premium.reprobe(context.bot, update.effective_user.id)
+    await _view(update, context)
+
+
+@admin_only
+async def on_pack_ask(update, context):
+    await ui.ack(update)
+    context.user_data["state"] = "await_emojipack"
+    await ui.show(update, context, texts.PREMIUM_PACK_ASK, kb.back("adm_premium"))
+
+
+async def handle_pack(update, context):
+    raw = (update.message.text or "").strip()
+    await ui.clean(update)
+    m = re.search(r"(?:addemoji|addstickers)/([A-Za-z0-9_]+)", raw) or re.fullmatch(r"@?([A-Za-z0-9_]{3,})", raw)
+    if not m:
+        return await ui.show(update, context, texts.PREMIUM_ERR, kb.back("adm_premium"))
+    name = m.group(1)
+    try:
+        pack = await context.bot.get_sticker_set(name)
+        if getattr(pack, "sticker_type", None) != "custom_emoji":
+            raise ValueError("pas un pack d'emojis")
+        mapping = {}
+        for st in pack.stickers:
+            if st.custom_emoji_id and st.emoji:
+                mapping.setdefault(st.emoji, st.custom_emoji_id)
+        if not mapping:
+            raise ValueError("pack vide")
+    except (TelegramError, ValueError):
+        return await ui.show(update, context, texts.PREMIUM_ERR, kb.back("adm_premium"))
+    db.set_setting("emoji_pack", name)
+    db.set_setting("emoji_map", json.dumps(mapping, ensure_ascii=False))
+    premium.PACK = name
+    premium.set_map(mapping)
+    if premium.OWNER_PREMIUM:
+        await premium.reprobe(context.bot, update.effective_user.id)
+    await _view(update, context)
+'''
 _SOURCES['router'] = r'''import config, ui
-import add_channel, admin, admin_tools
+import add_channel, admin, admin_tools, premium_admin, users
 
 
 async def on_message(update, context):
@@ -1787,6 +2380,10 @@ async def on_message(update, context):
         await admin.handle_header(update, context)
     elif state == "await_photo" and config.is_admin(update.effective_user.id):
         await admin.handle_photo(update, context)
+    elif state == "await_emojipack" and config.is_admin(update.effective_user.id):
+        await premium_admin.handle_pack(update, context)
+    elif state == "await_broadcast" and config.is_admin(update.effective_user.id):
+        await users.handle_broadcast(update, context)
     elif state == "await_backup" and config.is_admin(update.effective_user.id):
         await admin_tools.handle_backup(update, context)
     elif state in admin_tools.STATES and config.is_admin(update.effective_user.id):
@@ -1827,10 +2424,10 @@ _SOURCES['botmain'] = r'''import logging
 from datetime import time as dtime
 
 from telegram import Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, TypeHandler, filters
 
-import botcommands, config, cross, db, health, texts
-import add_channel, admin, admin_tools, commands, my_channels, router, start
+import botcommands, config, cross, db, health, premium, texts
+import add_channel, admin, admin_tools, commands, my_channels, premium_admin, router, start, users
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 # Les journaux HTTP affichent l'adresse complète des requêtes Telegram, qui contient le token : on les masque.
@@ -1841,6 +2438,7 @@ log = logging.getLogger("crossbot")
 
 async def post_init(app: Application):
     db.init()
+    premium.load()
     await botcommands.setup(app.bot)
     log.info("Base de données : %s", db.kind_label())
     if db.is_temporary():
@@ -1850,6 +2448,7 @@ async def post_init(app: Application):
                 await app.bot.send_message(admin_id, texts.WARN_TEMP_DB.format(names=", ".join(config.DB_HINT_NAMES) or "aucune"), parse_mode="HTML")
             except Exception:
                 pass
+    app.create_task(users.backfill_owners(app.bot))  # retrouve le nom des propriétaires de canaux déjà inscrits
     log.info("Bot démarré : @%s", app.bot.username)
 
 
@@ -1865,6 +2464,7 @@ def main():
     app = Application.builder().token(config.BOT_TOKEN).post_init(post_init).build()
 
     private = filters.ChatType.PRIVATE
+    app.add_handler(TypeHandler(Update, users.track), group=-1)  # enregistre qui utilise le bot (sans aucune notification)
     app.add_handler(CommandHandler("start", start.cmd_start, filters=private))
 
     for name, fn in [
@@ -1872,6 +2472,8 @@ def main():
         ("admin", commands.cmd_admin), ("planning", commands.cmd_planning), ("sponsors", commands.cmd_sponsors),
         ("publier", commands.cmd_publish), ("retirer", commands.cmd_stop),
         ("sauvegarde", commands.cmd_backup), ("restaurer", commands.cmd_restore),
+        ("broadcast", commands.cmd_broadcast), ("baoudaucast", commands.cmd_broadcast),
+        ("stop", users.cmd_unsubscribe),
     ]:
         app.add_handler(CommandHandler(name, fn, filters=private))
 
@@ -1891,6 +2493,13 @@ def main():
     app.add_handler(cb(admin.on_photo_del, pattern=r"^adm_photo_del$"))
     app.add_handler(cb(admin.on_sync, pattern=r"^adm_sync$"))
     app.add_handler(cb(admin.on_approval, pattern=r"^adm_approval$"))
+    app.add_handler(cb(users.on_ann_on, pattern=r"^ann_on$"))
+    app.add_handler(cb(premium_admin.on_premium, pattern=r"^adm_premium$"))
+    app.add_handler(cb(premium_admin.on_premium_mode, pattern=r"^adm_premium_mode$"))
+    app.add_handler(cb(premium_admin.on_pack_ask, pattern=r"^adm_premium_pack$"))
+    app.add_handler(cb(users.on_users, pattern=r"^adm_users(:\d+)?$"))
+    app.add_handler(cb(users.on_bc_ask, pattern=r"^adm_bc$"))
+    app.add_handler(cb(users.on_bc_go, pattern=r"^bc_go$"))
     app.add_handler(cb(admin_tools.on_backup, pattern=r"^adm_backup$"))
     app.add_handler(cb(admin_tools.on_restore_ask, pattern=r"^adm_restore$"))
     app.add_handler(cb(admin_tools.on_planning, pattern=r"^adm_plan$"))
@@ -1922,7 +2531,7 @@ if __name__ == "__main__":
     main()
 '''
 
-for _name in ['config', 'db', 'keyboards', 'texts', 'ui', 'cross', 'add_channel', 'admin', 'admin_tools', 'botcommands', 'my_channels', 'commands', 'health', 'router', 'start', 'botmain']:
+for _name in ['config', 'db', 'texts', 'premium', 'keyboards', 'ui', 'cross', 'add_channel', 'admin', 'admin_tools', 'botcommands', 'my_channels', 'users', 'commands', 'health', 'premium_admin', 'router', 'start', 'botmain']:
     _mod = types.ModuleType(_name)
     sys.modules[_name] = _mod
     exec(compile(_SOURCES[_name], _name + ".py", "exec"), _mod.__dict__)
