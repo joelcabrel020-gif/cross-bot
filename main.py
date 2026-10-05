@@ -566,6 +566,19 @@ NAMES_DONE = (
     "👤 Récupérés : <b>{ok}</b> sur <b>{n}</b>\n\n"
     "<i>Ceux qui n'ont jamais écrit au bot restent « Sans nom » jusqu'à leur première action.</i>"
 )
+
+PV_PANEL = (
+    "👀 <b>Aperçu de la cross</b>\n" + LINE + "\n\n"
+    "👆 Voici comment elle apparaîtra dans les canaux.\n\n"
+    "📝 Changements : <b>{changes}</b>\n\n"
+    "🔒 <i>Rien n'est publié tant que tu n'as pas validé. La cross actuelle reste telle qu'elle est.</i>"
+)
+PV_TOO_LONG = "⚠️ Avec une photo, le texte est limité à <b>1024 caractères</b> (le tien en fait <b>{n}</b>). Modifie le texte ou retire la photo."
+PV_ERROR = "⚠️ Aperçu impossible (texte ou photo refusés par Telegram). Modifie ton texte ou renvoie la photo."
+PV_DONE = "✅ <b>Changement publié</b>\n" + LINE + "\n\nLa cross se met à jour dans tous les canaux."
+PV_DONE_WAIT = "✅ <b>Changement enregistré</b>\n" + LINE + "\n\nIl sera visible à la prochaine diffusion de la cross."
+PV_CANCEL = "✖️ <b>Changement annulé</b>\n" + LINE + "\n\nLa cross reste telle qu'elle était."
+PV_NONE = "ℹ️ Aucun changement en attente."
 '''
 _SOURCES['premium'] = r'''"""Emojis premium : remplacement automatique dans les messages privés du bot quand le compte Premium l'utilise.
 Telegram n'autorise pas les emojis premium d'un bot dans les canaux : la cross publiée garde les emojis normaux."""
@@ -883,6 +896,15 @@ def premium_menu(on=True):
         [B("🔴  Désactiver", "adm_premium_mode", "danger") if on else B("🟢  Activer", "adm_premium_mode", "success")],
         [B("⬅️  Retour", "admin")],
     ])
+
+
+def preview_menu(error=False):
+    rows = []
+    if not error:
+        rows.append([B("✅  Valider et publier", "pv_ok", "success")])
+    rows.append([B("✏️  Modifier le texte", "pv_text"), B("🖼  Modifier la photo", "pv_photo")])
+    rows.append([B("✖️  Annuler, garder l'ancienne", "pv_no", "danger")])
+    return M(rows)
 '''
 _SOURCES['ui'] = r'''"""Panneau unique : chaque étape édite le même message, les messages de l'utilisateur sont supprimés."""
 from telegram import LinkPreviewOptions
@@ -1537,6 +1559,149 @@ async def on_confirm(update, context):
             pass
     await ui.show(update, context, texts.PENDING, kb.back())
 '''
+_SOURCES['preview'] = r'''"""Aperçu et validation des changements de texte / photo de la cross.
+Rien n'est modifié dans les canaux tant que l'admin n'a pas appuyé sur « Valider »."""
+import functools
+import html
+import re
+
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
+
+import config, cross, db, keyboards as kb, texts, ui
+from ui import NO_PREVIEW
+
+
+def _admin(fn):
+    @functools.wraps(fn)
+    async def wrapper(update, context):
+        if not config.is_admin(update.effective_user.id):
+            await ui.ack(update, "Accès refusé", show_alert=True)
+            return
+        return await fn(update, context)
+    return wrapper
+
+
+def _current():
+    return db.get_setting("header", config.DEFAULT_HEADER), (db.get_setting("photo") or None)
+
+
+async def clear_preview(context):
+    msg = context.user_data.pop("preview_msg", None)
+    if msg:
+        try:
+            await context.bot.delete_message(msg[0], msg[1])
+        except TelegramError:
+            pass
+
+
+async def reset(context):
+    """Abandonne un éventuel brouillon (nouvelle modification depuis le panneau admin)."""
+    context.user_data.pop("cross_draft", None)
+    await clear_preview(context)
+
+
+async def begin(update, context, header=None, photo=None):
+    """Crée ou complète le brouillon, puis affiche l'aperçu. photo=None : inchangée ; photo="" : retirée."""
+    draft = context.user_data.setdefault("cross_draft", {})
+    if header is not None:
+        draft["header"] = header
+    if photo is not None:
+        draft["photo"] = photo
+    await show(update, context)
+
+
+async def show(update, context):
+    context.user_data.pop("state", None)
+    draft = context.user_data.get("cross_draft") or {}
+    cur_header, cur_photo = _current()
+    header = draft.get("header", cur_header)
+    photo = (draft["photo"] if "photo" in draft else cur_photo) or None
+
+    plain = html.unescape(re.sub(r"<[^>]+>", "", header.replace("{count}", "00")))
+    if photo and len(plain) > 1024:
+        await clear_preview(context)
+        return await ui.fresh(update, context, texts.PV_TOO_LONG.format(n=len(plain)), kb.preview_menu(error=True))
+
+    channels = db.list_channels("active")[:config.GROUP_SIZE]
+    markup = cross.build_markup(context.bot.username, channels, db.list_extras())
+    caption = header.replace("{count}", str(len(channels)))
+    chat_id = update.effective_chat.id
+    await clear_preview(context)
+    try:
+        if photo:
+            sent = await context.bot.send_photo(chat_id, photo, caption=caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+        else:
+            sent = await context.bot.send_message(
+                chat_id, caption, parse_mode=ParseMode.HTML, reply_markup=markup, link_preview_options=NO_PREVIEW
+            )
+    except TelegramError:
+        return await ui.fresh(update, context, texts.PV_ERROR, kb.preview_menu(error=True))
+    context.user_data["preview_msg"] = (sent.chat_id, sent.message_id)
+
+    changes = []
+    if "header" in draft and draft["header"] != cur_header:
+        changes.append("texte")
+    if "photo" in draft and (draft["photo"] or None) != cur_photo:
+        changes.append("photo retirée" if not draft["photo"] else "photo")
+    await ui.fresh(update, context, texts.PV_PANEL.format(changes=" + ".join(changes) or "aucun"), kb.preview_menu())
+
+
+@_admin
+async def on_ok(update, context):
+    draft = context.user_data.pop("cross_draft", None)
+    await clear_preview(context)
+    if not draft:
+        await ui.ack(update, "Aucun changement en attente", show_alert=True)
+        return await ui.show(update, context, texts.PV_NONE, kb.back("admin"))
+    old_photo = db.get_setting("photo") or None
+    new_photo = old_photo
+    if "header" in draft:
+        db.set_setting("header", draft["header"])
+    if "photo" in draft:
+        db.set_setting("photo", draft["photo"])
+        new_photo = draft["photo"] or None
+    await ui.ack(update, "Changement validé ✅")
+    if cross.is_live():
+        task = cross.repost_all if new_photo != old_photo else cross.sync_all  # changer de photo = republier le message
+        context.application.create_task(task(context.bot))
+        text = texts.PV_DONE
+    else:
+        text = texts.PV_DONE_WAIT
+    await ui.show(update, context, text, kb.back("admin"))
+
+
+@_admin
+async def on_no(update, context):
+    await reset(context)
+    await ui.ack(update, "Changement annulé")
+    await ui.show(update, context, texts.PV_CANCEL, kb.back("admin"))
+
+
+@_admin
+async def on_back(update, context):
+    await ui.ack(update)
+    await show(update, context)
+
+
+@_admin
+async def on_edit_text(update, context):
+    await ui.ack(update)
+    context.user_data["state"] = "await_header"
+    draft = context.user_data.get("cross_draft") or {}
+    current = draft.get("header", db.get_setting("header", config.DEFAULT_HEADER))
+    await ui.show(update, context, texts.ADMIN_HEADER.format(current=current), kb.back("pv_back"))
+
+
+@_admin
+async def on_edit_photo(update, context):
+    await ui.ack(update)
+    context.user_data["state"] = "await_photo"
+    draft = context.user_data.get("cross_draft") or {}
+    has = (draft["photo"] if "photo" in draft else db.get_setting("photo"))
+    state = "✅ Une photo est définie." if has else "Aucune photo définie."
+    await ui.show(update, context, texts.ADMIN_PHOTO.format(state=state), kb.back("pv_back"))
+'''
 _SOURCES['admin'] = r'''import functools
 import html
 import math
@@ -1545,7 +1710,7 @@ import re
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
-import config, cross, db, keyboards as kb, texts, ui
+import config, cross, db, keyboards as kb, preview, texts, ui
 
 
 def admin_only(fn):
@@ -1585,6 +1750,7 @@ async def on_admin(update, context):
 @admin_only
 async def on_header_ask(update, context):
     await ui.ack(update)
+    await preview.reset(context)
     context.user_data["state"] = "await_header"
     current = db.get_setting("header", config.DEFAULT_HEADER)
     await ui.show(update, context, texts.ADMIN_HEADER.format(current=current), kb.back("admin"))
@@ -1596,11 +1762,7 @@ async def handle_header(update, context):
     await ui.clean(update)
     if not new:
         return
-    if db.get_setting("photo") and len(plain) > 1024:
-        return await ui.show(update, context, texts.ERR_CAPTION, kb.back("admin"))
-    db.set_setting("header", new)
-    context.application.create_task(cross.sync_all(context.bot))
-    await _panel(update, context)
+    await preview.begin(update, context, header=new)
 
 
 @admin_only
@@ -1673,6 +1835,7 @@ async def on_admin_delete(update, context):
 @admin_only
 async def on_photo_ask(update, context):
     await ui.ack(update)
+    await preview.reset(context)
     context.user_data["state"] = "await_photo"
     state = "✅ Une photo est définie." if db.get_setting("photo") else "Aucune photo définie."
     await ui.show(update, context, texts.ADMIN_PHOTO.format(state=state), kb.photo_menu())
@@ -1684,20 +1847,14 @@ async def handle_photo(update, context):
     await ui.clean(update)
     if not photo:
         return
-    header_plain = re.sub(r"<[^>]+>", "", db.get_setting("header", config.DEFAULT_HEADER))
-    if len(header_plain) > 1024:
-        return await ui.show(update, context, texts.ERR_CAPTION, kb.back("admin"))
-    db.set_setting("photo", photo)
-    context.application.create_task(cross.repost_all(context.bot))
-    await _panel(update, context)
+    await preview.begin(update, context, photo=photo)
 
 
 @admin_only
 async def on_photo_del(update, context):
-    await ui.ack(update, "Photo retirée ✅")
-    db.set_setting("photo", "")
-    context.application.create_task(cross.repost_all(context.bot))
-    await _panel(update, context)
+    await ui.ack(update)
+    await preview.reset(context)
+    await preview.begin(update, context, photo="")
 '''
 _SOURCES['admin_tools'] = r'''"""Outils admin : planning (publication / suppression automatiques) et sponsors."""
 import html
@@ -2505,7 +2662,7 @@ from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, TypeHandler, filters
 
 import botcommands, config, cross, db, health, premium, texts
-import add_channel, admin, admin_tools, commands, my_channels, premium_admin, router, start, users
+import add_channel, admin, admin_tools, commands, my_channels, premium_admin, preview, router, start, users
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 # Les journaux HTTP affichent l'adresse complète des requêtes Telegram, qui contient le token : on les masque.
@@ -2571,6 +2728,11 @@ def main():
     app.add_handler(cb(admin.on_photo_del, pattern=r"^adm_photo_del$"))
     app.add_handler(cb(admin.on_sync, pattern=r"^adm_sync$"))
     app.add_handler(cb(admin.on_approval, pattern=r"^adm_approval$"))
+    app.add_handler(cb(preview.on_ok, pattern=r"^pv_ok$"))
+    app.add_handler(cb(preview.on_no, pattern=r"^pv_no$"))
+    app.add_handler(cb(preview.on_back, pattern=r"^pv_back$"))
+    app.add_handler(cb(preview.on_edit_text, pattern=r"^pv_text$"))
+    app.add_handler(cb(preview.on_edit_photo, pattern=r"^pv_photo$"))
     app.add_handler(cb(users.on_ann_on, pattern=r"^ann_on$"))
     app.add_handler(cb(premium_admin.on_premium, pattern=r"^adm_premium$"))
     app.add_handler(cb(premium_admin.on_premium_mode, pattern=r"^adm_premium_mode$"))
@@ -2610,7 +2772,7 @@ if __name__ == "__main__":
     main()
 '''
 
-for _name in ['config', 'db', 'texts', 'premium', 'keyboards', 'ui', 'cross', 'add_channel', 'admin', 'admin_tools', 'botcommands', 'my_channels', 'users', 'commands', 'health', 'premium_admin', 'router', 'start', 'botmain']:
+for _name in ['config', 'db', 'texts', 'premium', 'keyboards', 'ui', 'cross', 'add_channel', 'preview', 'admin', 'admin_tools', 'botcommands', 'my_channels', 'users', 'commands', 'health', 'premium_admin', 'router', 'start', 'botmain']:
     _mod = types.ModuleType(_name)
     sys.modules[_name] = _mod
     exec(compile(_SOURCES[_name], _name + ".py", "exec"), _mod.__dict__)
